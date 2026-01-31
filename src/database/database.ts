@@ -2,9 +2,10 @@ import Database from 'better-sqlite3';
 import * as path from 'path';
 import * as fs from 'fs';
 import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH } from './schema';
-import { runMigrations, getCurrentVersion } from './migrations';
+import { runMigrations } from './migrations';
+import type { IDatabase } from '../interfaces/IDatabase';
 
-class DatabaseService {
+export class DatabaseService implements IDatabase {
   private db: Database.Database | null = null;
 
   initialize(dbPath: string): void {
@@ -31,13 +32,33 @@ class DatabaseService {
     console.log('[Database] Initialized successfully');
   }
 
+  initializeInMemory(): void {
+    // Open in-memory database
+    this.db = new Database(':memory:', {
+      verbose: process.env.NODE_ENV === 'development' ? console.log : undefined,
+    });
+
+    // Enable foreign keys
+    this.db.pragma('foreign_keys = ON');
+
+    // Apply schema
+    this.applySchema();
+
+    // In-memory databases don't log by default in tests
+    if (process.env.NODE_ENV !== 'test') {
+      console.log('[Database] Initialized in-memory database');
+    }
+  }
+
   private applySchema(): void {
     if (!this.db) throw new Error('Database not initialized');
 
     // Run migrations (handles both new and existing databases)
     runMigrations(this.db);
 
-    console.log('[Database] Schema applied');
+    if (process.env.NODE_ENV !== 'test') {
+      console.log('[Database] Schema applied');
+    }
   }
 
   query<T = any>(sql: string, params: any[] = []): T[] {
@@ -64,7 +85,9 @@ class DatabaseService {
     if (this.db) {
       this.db.close();
       this.db = null;
-      console.log('[Database] Connection closed');
+      if (process.env.NODE_ENV !== 'test') {
+        console.log('[Database] Connection closed');
+      }
     }
   }
 
@@ -74,4 +97,10 @@ class DatabaseService {
   }
 }
 
+// Factory function for creating database instances (for testing)
+export function createDatabase(): IDatabase {
+  return new DatabaseService();
+}
+
+// Default singleton instance for backward compatibility
 export default new DatabaseService();

@@ -1,20 +1,19 @@
 import { nanoid } from 'nanoid';
-import Database from '../database/database';
+import DefaultDatabase from '../database/database';
 import type { Guide, GuideMetadata } from '../types';
+import type { IDatabase } from '../interfaces/IDatabase';
+import type { IGuideModel, SearchResults } from '../interfaces/IGuideModel';
 
 interface FTSResult {
   guide_id: string;
   rank: number;
 }
 
-export interface SearchResults {
-  // Guides matching on title/tags (metadata)
-  guides: Guide[];
-  // Guides matching on content
-  content: Guide[];
-}
+export { SearchResults };
 
-class GuideModel {
+export class GuideModel implements IGuideModel {
+  constructor(private db: IDatabase = DefaultDatabase) {}
+
   create(data: Omit<Guide, 'id' | 'created_at' | 'updated_at'>): Guide {
     const now = Date.now();
     const guide: Guide = {
@@ -24,7 +23,7 @@ class GuideModel {
       updated_at: now,
     };
 
-    Database.run(
+    this.db.run(
       `INSERT INTO guides (id, title, content, format, file_path, game_id, last_read_position, metadata, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
@@ -45,19 +44,19 @@ class GuideModel {
   }
 
   findById(id: string): Guide | null {
-    const result = Database.get<Guide>('SELECT * FROM guides WHERE id = ?', [id]);
+    const result = this.db.get<Guide>('SELECT * FROM guides WHERE id = ?', [id]);
     return result ?? null;
   }
 
   findAll(limit = 100, offset = 0): Guide[] {
-    return Database.query<Guide>(
+    return this.db.query<Guide>(
       'SELECT * FROM guides ORDER BY updated_at DESC LIMIT ? OFFSET ?',
       [limit, offset]
     );
   }
 
   findByGameId(gameId: string): Guide[] {
-    return Database.query<Guide>(
+    return this.db.query<Guide>(
       'SELECT * FROM guides WHERE game_id = ? ORDER BY title ASC',
       [gameId]
     );
@@ -82,7 +81,7 @@ class GuideModel {
     // Add id for WHERE clause
     values.push(id);
 
-    const result = Database.run(
+    const result = this.db.run(
       `UPDATE guides SET ${fields.join(', ')} WHERE id = ?`,
       values
     );
@@ -95,23 +94,19 @@ class GuideModel {
   }
 
   delete(id: string): boolean {
-    const result = Database.run('DELETE FROM guides WHERE id = ?', [id]);
+    const result = this.db.run('DELETE FROM guides WHERE id = ?', [id]);
     return result.changes > 0;
   }
 
-  /**
-   * Search guides using split FTS tables
-   * Returns results separated by match type (metadata vs content)
-   */
   search(query: string, limit = 50): SearchResults {
     // Search metadata FTS (title + tags)
-    const metaResults = Database.query<FTSResult>(
+    const metaResults = this.db.query<FTSResult>(
       `SELECT guide_id, rank FROM guides_fts_meta WHERE guides_fts_meta MATCH ? ORDER BY rank LIMIT ?`,
       [query, limit]
     );
 
     // Search content FTS
-    const contentResults = Database.query<FTSResult>(
+    const contentResults = this.db.query<FTSResult>(
       `SELECT guide_id, rank FROM guides_fts_content WHERE guides_fts_content MATCH ? ORDER BY rank LIMIT ?`,
       [query, limit]
     );
@@ -120,7 +115,7 @@ class GuideModel {
     const fetchGuides = (ids: string[]): Guide[] => {
       if (ids.length === 0) return [];
       const placeholders = ids.map(() => '?').join(',');
-      return Database.query<Guide>(
+      return this.db.query<Guide>(
         `SELECT * FROM guides WHERE id IN (${placeholders})`,
         ids
       );
@@ -139,10 +134,6 @@ class GuideModel {
     };
   }
 
-  /**
-   * Legacy search method that returns combined results
-   * @deprecated Use search() which returns separated results
-   */
   searchCombined(query: string, limit = 50): Guide[] {
     const results = this.search(query, limit);
     // Combine and dedupe
@@ -180,30 +171,27 @@ class GuideModel {
   }
 
   getTotalCount(): number {
-    const result = Database.get<{ count: number }>('SELECT COUNT(*) as count FROM guides');
+    const result = this.db.get<{ count: number }>('SELECT COUNT(*) as count FROM guides');
     return result?.count ?? 0;
   }
 
   getRecentlyRead(limit = 10): Guide[] {
-    return Database.query<Guide>(
+    return this.db.query<Guide>(
       'SELECT * FROM guides WHERE last_read_position IS NOT NULL ORDER BY updated_at DESC LIMIT ?',
       [limit]
     );
   }
 
   bulkCreate(guides: Array<Omit<Guide, 'id' | 'created_at' | 'updated_at'>>): void {
-    Database.transaction(() => {
+    this.db.transaction(() => {
       for (const guideData of guides) {
         this.create(guideData);
       }
     });
   }
 
-  /**
-   * Find guides that have never been analyzed by AI
-   */
   findMissingMetadata(limit = 100): Guide[] {
-    return Database.query<Guide>(
+    return this.db.query<Guide>(
       `SELECT * FROM guides
        WHERE metadata IS NULL
           OR json_extract(metadata, '$.aiAnalyzedAt') IS NULL
@@ -213,11 +201,8 @@ class GuideModel {
     );
   }
 
-  /**
-   * Find guides with empty or null tags
-   */
   findMissingTags(limit = 100): Guide[] {
-    return Database.query<Guide>(
+    return this.db.query<Guide>(
       `SELECT * FROM guides
        WHERE metadata IS NULL
           OR json_extract(metadata, '$.tags') IS NULL
@@ -228,11 +213,8 @@ class GuideModel {
     );
   }
 
-  /**
-   * Find guides without a summary
-   */
   findMissingSummary(limit = 100): Guide[] {
-    return Database.query<Guide>(
+    return this.db.query<Guide>(
       `SELECT * FROM guides
        WHERE metadata IS NULL
           OR json_extract(metadata, '$.summary') IS NULL
@@ -244,7 +226,7 @@ class GuideModel {
   }
 
   findAllWithGames(): Array<{ guide: Guide; game: any | null }> {
-    const results = Database.query<any>(
+    const results = this.db.query<any>(
       `SELECT
         g.*,
         games.id as game_id_val,
@@ -278,9 +260,8 @@ class GuideModel {
     }));
   }
 
-  // Get guide content without the full content (for listings)
   findAllSummary(limit = 100, offset = 0): Array<Omit<Guide, 'content'> & { content_length: number }> {
-    return Database.query<Omit<Guide, 'content'> & { content_length: number }>(
+    return this.db.query<Omit<Guide, 'content'> & { content_length: number }>(
       `SELECT id, title, format, file_path, game_id, last_read_position, metadata,
               created_at, updated_at, LENGTH(content) as content_length
        FROM guides ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
@@ -289,4 +270,10 @@ class GuideModel {
   }
 }
 
+// Factory function for creating model instances (for testing)
+export function createGuideModel(db: IDatabase): IGuideModel {
+  return new GuideModel(db);
+}
+
+// Default singleton instance for backward compatibility
 export default new GuideModel();

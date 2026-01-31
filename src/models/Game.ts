@@ -1,8 +1,12 @@
 import { nanoid } from 'nanoid';
-import Database from '../database/database';
+import DefaultDatabase from '../database/database';
 import type { Game, GameMetadata } from '../types';
+import type { IDatabase } from '../interfaces/IDatabase';
+import type { IGameModel } from '../interfaces/IGameModel';
 
-class GameModel {
+export class GameModel implements IGameModel {
+  constructor(private db: IDatabase = DefaultDatabase) {}
+
   create(data: Omit<Game, 'id' | 'created_at' | 'updated_at' | 'completion_percentage' | 'status'> & {
     completion_percentage?: number;
     status?: Game['status'];
@@ -17,7 +21,7 @@ class GameModel {
       updated_at: now,
     };
 
-    Database.run(
+    this.db.run(
       `INSERT INTO games (id, title, ra_game_id, platform, completion_percentage, status, artwork_url, metadata, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
@@ -38,24 +42,24 @@ class GameModel {
   }
 
   findById(id: string): Game | null {
-    const result = Database.get<Game>('SELECT * FROM games WHERE id = ?', [id]);
+    const result = this.db.get<Game>('SELECT * FROM games WHERE id = ?', [id]);
     return result ?? null;
   }
 
   findByRAGameId(raGameId: string): Game | null {
-    const result = Database.get<Game>('SELECT * FROM games WHERE ra_game_id = ?', [raGameId]);
+    const result = this.db.get<Game>('SELECT * FROM games WHERE ra_game_id = ?', [raGameId]);
     return result ?? null;
   }
 
   findAll(limit = 100, offset = 0): Game[] {
-    return Database.query<Game>(
+    return this.db.query<Game>(
       'SELECT * FROM games ORDER BY title ASC LIMIT ? OFFSET ?',
       [limit, offset]
     );
   }
 
   findByStatus(status: Game['status']): Game[] {
-    return Database.query<Game>(
+    return this.db.query<Game>(
       'SELECT * FROM games WHERE status = ? ORDER BY updated_at DESC',
       [status]
     );
@@ -85,7 +89,7 @@ class GameModel {
 
     values.push(id);
 
-    const result = Database.run(
+    const result = this.db.run(
       `UPDATE games SET ${fields.join(', ')} WHERE id = ?`,
       values
     );
@@ -114,7 +118,7 @@ class GameModel {
   }
 
   delete(id: string): boolean {
-    const result = Database.run('DELETE FROM games WHERE id = ?', [id]);
+    const result = this.db.run('DELETE FROM games WHERE id = ?', [id]);
     return result.changes > 0;
   }
 
@@ -136,12 +140,12 @@ class GameModel {
   }
 
   getTotalCount(): number {
-    const result = Database.get<{ count: number }>('SELECT COUNT(*) as count FROM games');
+    const result = this.db.get<{ count: number }>('SELECT COUNT(*) as count FROM games');
     return result?.count ?? 0;
   }
 
   getWithGuideCount(): Array<Game & { guide_count: number }> {
-    return Database.query<Game & { guide_count: number }>(`
+    return this.db.query<Game & { guide_count: number }>(`
       SELECT g.*, COUNT(gu.id) as guide_count
       FROM games g
       LEFT JOIN guides gu ON g.id = gu.game_id
@@ -151,7 +155,7 @@ class GameModel {
   }
 
   searchByTitle(query: string): Game[] {
-    return Database.query<Game>(
+    return this.db.query<Game>(
       'SELECT * FROM games WHERE title LIKE ? ORDER BY title ASC LIMIT 50',
       [`%${query}%`]
     );
@@ -161,16 +165,15 @@ class GameModel {
     completion_percentage?: number;
     status?: Game['status'];
   }>): void {
-    Database.transaction(() => {
+    this.db.transaction(() => {
       for (const gameData of games) {
         this.create(gameData);
       }
     });
   }
 
-  // Find game by external ID in metadata (uses indexed json_extract for fast lookup)
   findByExternalId(externalId: string): Game | null {
-    const result = Database.get<Game>(
+    const result = this.db.get<Game>(
       "SELECT * FROM games WHERE json_extract(metadata, '$.external_id') = ? LIMIT 1",
       [externalId]
     );
@@ -178,4 +181,10 @@ class GameModel {
   }
 }
 
+// Factory function for creating model instances (for testing)
+export function createGameModel(db: IDatabase): IGameModel {
+  return new GameModel(db);
+}
+
+// Default singleton instance for backward compatibility
 export default new GameModel();
