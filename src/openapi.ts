@@ -14,6 +14,8 @@ export const openApiSpec = {
   tags: [
     { name: 'Health', description: 'Health and readiness checks' },
     { name: 'Guides', description: 'GameFAQs guides (list, search, content)' },
+    { name: 'Bookmarks', description: 'Bookmarks for guides' },
+    { name: 'Notes', description: 'Notes for guides' },
     { name: 'Games', description: 'Games and guides by game' },
     { name: 'Admin', description: 'Admin status (optional token)' },
   ],
@@ -167,6 +169,192 @@ export const openApiSpec = {
         },
       },
     },
+    '/api/guides/{guideId}/bookmarks': {
+      get: {
+        tags: ['Bookmarks'],
+        summary: 'List bookmarks for a guide',
+        parameters: [{ name: 'guideId', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          '200': {
+            description: 'OK',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    data: { type: 'array', items: { $ref: '#/components/schemas/Bookmark' } },
+                  },
+                },
+              },
+            },
+          },
+          '404': { description: 'Guide not found' },
+        },
+      },
+      post: {
+        tags: ['Bookmarks'],
+        summary: 'Create bookmark',
+        parameters: [{ name: 'guideId', in: 'path', required: true, schema: { type: 'string' } }],
+        requestBody: {
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['position'],
+                properties: {
+                  position: { type: 'number', minimum: 0 },
+                  name: { type: 'string', nullable: true },
+                  page_reference: { type: 'string', nullable: true },
+                  is_last_read: { type: 'boolean', default: false },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '201': {
+            description: 'Created',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    data: { $ref: '#/components/schemas/Bookmark' },
+                  },
+                },
+              },
+            },
+          },
+          '400': { description: 'Invalid position' },
+          '404': { description: 'Guide not found' },
+        },
+      },
+    },
+    '/api/guides/{guideId}/bookmarks/{id}': {
+      delete: {
+        tags: ['Bookmarks'],
+        summary: 'Delete bookmark',
+        parameters: [
+          { name: 'guideId', in: 'path', required: true, schema: { type: 'string' } },
+          { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        responses: {
+          '200': { description: 'OK' },
+          '404': { description: 'Guide or bookmark not found' },
+        },
+      },
+    },
+    '/api/guides/{guideId}/notes': {
+      get: {
+        tags: ['Notes'],
+        summary: 'List notes for a guide',
+        parameters: [{ name: 'guideId', in: 'path', required: true, schema: { type: 'string' } }],
+        responses: {
+          '200': {
+            description: 'OK',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    data: { type: 'array', items: { $ref: '#/components/schemas/Note' } },
+                  },
+                },
+              },
+            },
+          },
+          '404': { description: 'Guide not found' },
+        },
+      },
+      post: {
+        tags: ['Notes'],
+        summary: 'Create note',
+        parameters: [{ name: 'guideId', in: 'path', required: true, schema: { type: 'string' } }],
+        requestBody: {
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['content'],
+                properties: {
+                  position: { type: 'number', minimum: 0, nullable: true },
+                  content: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '201': {
+            description: 'Created',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    data: { $ref: '#/components/schemas/Note' },
+                  },
+                },
+              },
+            },
+          },
+          '400': { description: 'Invalid content or position' },
+          '404': { description: 'Guide not found' },
+        },
+      },
+    },
+    '/api/guides/{guideId}/notes/{id}': {
+      put: {
+        tags: ['Notes'],
+        summary: 'Update note',
+        parameters: [
+          { name: 'guideId', in: 'path', required: true, schema: { type: 'string' } },
+          { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        requestBody: {
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  position: { type: 'number', minimum: 0, nullable: true },
+                  content: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': {
+            description: 'OK',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    data: { $ref: '#/components/schemas/Note' },
+                  },
+                },
+              },
+            },
+          },
+          '400': { description: 'Invalid content or position' },
+          '404': { description: 'Guide or note not found' },
+        },
+      },
+      delete: {
+        tags: ['Notes'],
+        summary: 'Delete note',
+        parameters: [
+          { name: 'guideId', in: 'path', required: true, schema: { type: 'string' } },
+          { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+        ],
+        responses: {
+          '200': { description: 'OK' },
+          '404': { description: 'Guide or note not found' },
+        },
+      },
+    },
     '/api/games': {
       get: {
         tags: ['Games'],
@@ -314,6 +502,29 @@ export const openApiSpec = {
           limit: { type: 'integer' },
           total: { type: 'integer' },
           totalPages: { type: 'integer' },
+        },
+      },
+      Bookmark: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          guide_id: { type: 'string' },
+          position: { type: 'number' },
+          name: { type: 'string', nullable: true },
+          page_reference: { type: 'string', nullable: true },
+          is_last_read: { type: 'boolean' },
+          created_at: { type: 'number' },
+        },
+      },
+      Note: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          guide_id: { type: 'string' },
+          position: { type: 'number', nullable: true },
+          content: { type: 'string' },
+          created_at: { type: 'number' },
+          updated_at: { type: 'number' },
         },
       },
     },

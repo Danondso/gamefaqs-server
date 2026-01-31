@@ -9,6 +9,7 @@ import { openApiSpec } from './openapi';
 import { corsMiddleware } from './middleware/cors';
 import { requestLogger } from './middleware/logger';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
+import { createRateLimiter } from './middleware/rateLimit';
 
 // Routes
 import guidesRouter from './routes/guides';
@@ -16,6 +17,8 @@ import gamesRouter from './routes/games';
 import healthRouter from './routes/health';
 import adminRouter from './routes/admin';
 import aiRouter from './routes/ai';
+import bookmarksRouter from './routes/bookmarks';
+import notesRouter from './routes/notes';
 
 async function main() {
   console.log('='.repeat(50));
@@ -90,9 +93,12 @@ async function main() {
 
   // API Routes
   app.use('/api/guides', guidesRouter);
+  app.use('/api/guides/:guideId/bookmarks', bookmarksRouter);
+  app.use('/api/guides/:guideId/notes', notesRouter);
   app.use('/api/games', gamesRouter);
   app.use('/api/health', healthRouter);
-  app.use('/api/admin', adminRouter);
+  // Rate limit admin routes (100 requests per minute per IP)
+  app.use('/api/admin', createRateLimiter({ windowMs: 60_000, max: 100 }), adminRouter);
   app.use('/api/ai', aiRouter);
 
   // Redirect root to admin panel

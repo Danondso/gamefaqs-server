@@ -73,16 +73,31 @@ export class GameModel implements IGameModel {
     return this.findByStatus('completed');
   }
 
+  /** Allowed column names for UPDATE (prevents SQL injection from untrusted keys) */
+  private static readonly ALLOWED_UPDATE_KEYS = new Set([
+    'title',
+    'ra_game_id',
+    'platform',
+    'completion_percentage',
+    'status',
+    'artwork_url',
+    'metadata',
+    'updated_at',
+  ]);
+
   update(id: string, data: Partial<Omit<Game, 'id' | 'created_at'>>): boolean {
     const fields: string[] = [];
     const values: any[] = [];
 
+    // Build dynamic update query using allowlist only (prevents SQL injection)
     Object.entries(data).forEach(([key, value]) => {
-      if (key !== 'id' && key !== 'created_at') {
+      if (GameModel.ALLOWED_UPDATE_KEYS.has(key)) {
         fields.push(`${key} = ?`);
         values.push(value);
       }
     });
+
+    if (fields.length === 0) return false;
 
     fields.push('updated_at = ?');
     values.push(Date.now());

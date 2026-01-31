@@ -55,8 +55,22 @@ const migration_v1: Migration = {
   },
 };
 
+// Migration v2: Add missing updated_at index for pagination performance
+const migration_v2: Migration = {
+  version: 2,
+  up: (db: Database.Database) => {
+    // Add index on updated_at for ORDER BY updated_at DESC queries (pagination)
+    db.exec('CREATE INDEX IF NOT EXISTS idx_guides_updated_at ON guides(updated_at);');
+    db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (2, ${Date.now()})`);
+  },
+  down: (db: Database.Database) => {
+    db.exec('DROP INDEX IF EXISTS idx_guides_updated_at');
+    db.exec('DELETE FROM schema_version WHERE version = 2');
+  },
+};
+
 // All migrations in order
-export const migrations: Migration[] = [migration_v1];
+export const migrations: Migration[] = [migration_v1, migration_v2];
 
 // Get current schema version from database
 export function getCurrentVersion(db: Database.Database): number {
@@ -108,7 +122,11 @@ export function runMigrations(db: Database.Database): void {
   console.log('[Migrations] All migrations completed successfully');
 }
 
-// Rollback to a specific version (for development/testing)
+/**
+ * Rollback to a specific version (for development/testing only).
+ * SECURITY: Never expose this function to user input (e.g. HTTP request).
+ * It uses string interpolation for targetVersion; if called with untrusted input, SQL injection is possible.
+ */
 export function rollbackTo(db: Database.Database, targetVersion: number): void {
   const currentVersion = getCurrentVersion(db);
 

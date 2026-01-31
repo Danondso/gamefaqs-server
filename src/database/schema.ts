@@ -1,7 +1,7 @@
 // SQLite database schema definitions
 // Ported from gamefaqs-reader mobile app
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export const CREATE_TABLES = {
   guides: `
@@ -92,6 +92,7 @@ export const CREATE_TABLES = {
 export const CREATE_INDEXES = {
   guides_game_id: 'CREATE INDEX IF NOT EXISTS idx_guides_game_id ON guides(game_id);',
   guides_created_at: 'CREATE INDEX IF NOT EXISTS idx_guides_created_at ON guides(created_at);',
+  guides_updated_at: 'CREATE INDEX IF NOT EXISTS idx_guides_updated_at ON guides(updated_at);',
   guides_ai_analyzed_at: 'CREATE INDEX IF NOT EXISTS idx_guides_ai_analyzed_at ON guides(ai_analyzed_at);',
   games_ra_game_id: 'CREATE INDEX IF NOT EXISTS idx_games_ra_game_id ON games(ra_game_id);',
   games_status: 'CREATE INDEX IF NOT EXISTS idx_games_status ON games(status);',

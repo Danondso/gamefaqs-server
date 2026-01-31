@@ -62,17 +62,32 @@ export class GuideModel implements IGuideModel {
     );
   }
 
+  /** Allowed column names for UPDATE (prevents SQL injection from untrusted keys) */
+  private static readonly ALLOWED_UPDATE_KEYS = new Set([
+    'title',
+    'content',
+    'format',
+    'file_path',
+    'game_id',
+    'last_read_position',
+    'metadata',
+    'ai_analyzed_at',
+    'updated_at',
+  ]);
+
   update(id: string, data: Partial<Omit<Guide, 'id' | 'created_at'>>): boolean {
     const fields: string[] = [];
     const values: any[] = [];
 
-    // Build dynamic update query
+    // Build dynamic update query using allowlist only (prevents SQL injection)
     Object.entries(data).forEach(([key, value]) => {
-      if (key !== 'id' && key !== 'created_at') {
+      if (GuideModel.ALLOWED_UPDATE_KEYS.has(key)) {
         fields.push(`${key} = ?`);
         values.push(value);
       }
     });
+
+    if (fields.length === 0) return false;
 
     // Always update updated_at
     fields.push('updated_at = ?');

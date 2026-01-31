@@ -7,6 +7,20 @@ export interface GuidesRouterDeps {
   guideModel: IGuideModel;
 }
 
+/**
+ * Sanitize a string for use in Content-Disposition filename to prevent
+ * header injection (CRLF, quotes, backslash).
+ */
+function sanitizeContentDispositionFilename(filename: string): string {
+  return filename
+    .replace(/\\/g, '_')
+    .replace(/"/g, "'")
+    .replace(/\r/g, '')
+    .replace(/\n/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim() || 'download';
+}
+
 export function createGuidesRouter(deps: GuidesRouterDeps): Router {
   const router = Router();
   const { guideModel } = deps;
@@ -117,7 +131,9 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
       };
 
       res.set('Content-Type', contentTypes[guide.format] || 'text/plain; charset=utf-8');
-      res.set('Content-Disposition', `inline; filename="${guide.title}.${guide.format}"`);
+      // Sanitize filename to prevent header injection (strip ", \r, \n, \)
+      const safeFilename = sanitizeContentDispositionFilename(`${guide.title}.${guide.format}`);
+      res.set('Content-Disposition', `inline; filename="${safeFilename}"`);
       res.send(guide.content);
     } catch (error) {
       next(error);

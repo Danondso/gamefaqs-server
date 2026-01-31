@@ -25,6 +25,9 @@ export const config = {
 
   // Development mode
   isDev: process.env.NODE_ENV !== 'production',
+
+  // CORS: in production, set CORS_ORIGIN to restrict (e.g. "https://app.example.com" or comma-separated list)
+  corsOrigin: process.env.CORS_ORIGIN,
 };
 
 // Ensure directories are absolute paths for Docker volumes

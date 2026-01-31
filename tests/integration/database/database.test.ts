@@ -40,7 +40,7 @@ describe('Database', () => {
 
     it('should record schema version', () => {
       const version = db.get<{ version: number }>('SELECT version FROM schema_version ORDER BY version DESC LIMIT 1');
-      expect(version?.version).toBe(1);
+      expect(version?.version).toBe(2);
     });
   });
 
