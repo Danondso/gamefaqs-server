@@ -1,0 +1,44 @@
+services:
+  gamefaqs-server:
+    build: .
+    container_name: gamefaqs-server
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      # Persistent data storage (~5-10GB for full import)
+      # For more disk space, use host path: - ./data:/data/db
+      - gamefaqs-data:/data/db
+      # Temporary storage for downloads and extraction (~15GB peak)
+      # For more disk space, use host path: - ./temp:/tmp/gamefaqs
+      - gamefaqs-temp:/tmp/gamefaqs
+    environment:
+      - NODE_ENV=production
+      - PORT=4848
+      - DB_PATH=/data/db/gamefaqs.db
+      - TEMP_DIR=/tmp/gamefaqs
+      # Optional: Set admin token for panel protection
+      - ADMIN_TOKEN=your-secret-token
+      # Optional: Ollama integration for AI-powered metadata
+      - OLLAMA_HOST=http://192.168.50.62:11434
+      - OLLAMA_MODEL=llama3.2:latest # set your default here, you can change it in the admin panel
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:3000/api/health/live",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  gamefaqs-data:
+    driver: local
+  gamefaqs-temp:
+    driver: local
