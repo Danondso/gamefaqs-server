@@ -1,7 +1,7 @@
 // SQLite database schema definitions
 // Ported from gamefaqs-reader mobile app
 
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 1;
 
 export const CREATE_TABLES = {
   guides: `
