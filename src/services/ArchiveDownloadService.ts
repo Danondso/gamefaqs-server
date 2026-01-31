@@ -22,21 +22,6 @@ class ArchiveDownloadService {
         fs.mkdirSync(dir, { recursive: true });
       }
 
-      // Try to get file size first (HEAD request) - but don't fail if it doesn't work
-      let totalBytes = 0;
-      try {
-        const headResponse = await axios.head(url, { timeout: 10000 });
-        totalBytes = parseInt(headResponse.headers['content-length'] || '0', 10);
-        if (totalBytes > 0) {
-          console.log('[Download] Total size:', (totalBytes / 1024 / 1024).toFixed(2), 'MB');
-        } else {
-          console.log('[Download] Could not determine file size, downloading without size info...');
-        }
-      } catch (headError: any) {
-        console.warn('[Download] HEAD request failed (will proceed anyway):', headError.message);
-        console.log('[Download] Proceeding with download without size information...');
-      }
-
       // Download the file with streaming
       const response = await axios.get(url, {
         responseType: 'stream',
@@ -44,6 +29,14 @@ class ArchiveDownloadService {
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
       });
+
+      // Get file size from response headers (more reliable than HEAD request)
+      const totalBytes = parseInt(response.headers['content-length'] || '0', 10);
+      if (totalBytes > 0) {
+        console.log('[Download] Total size:', (totalBytes / 1024 / 1024).toFixed(2), 'MB');
+      } else {
+        console.log('[Download] Server did not provide file size');
+      }
 
       // Create write stream
       const fileStream = fs.createWriteStream(destinationPath);
@@ -93,14 +86,6 @@ class ArchiveDownloadService {
       console.error('[Download] Failed to download archive:', error.message);
       throw error;
     }
-  }
-
-  /**
-   * Get file size from URL without downloading
-   */
-  async getFileSize(url: string): Promise<number> {
-    const response = await axios.head(url);
-    return parseInt(response.headers['content-length'] || '0', 10);
   }
 
   /**
