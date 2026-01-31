@@ -20,7 +20,7 @@ services:
       # Optional: Set admin token for panel protection
       - ADMIN_TOKEN=your-secret-token
       # Optional: Ollama integration for AI-powered metadata
-      - OLLAMA_HOST=http://192.168.50.62:11434
+      - OLLAMA_HOST=http:/localhost:11434
       - OLLAMA_MODEL=llama3.2:latest # set your default here, you can change it in the admin panel
     healthcheck:
       test:
