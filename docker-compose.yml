@@ -14,7 +14,7 @@ services:
       - gamefaqs-temp:/tmp/gamefaqs
     environment:
       - NODE_ENV=production
-      - PORT=4848
+      - PORT=3000
       - DB_PATH=/data/db/gamefaqs.db
       - TEMP_DIR=/tmp/gamefaqs
       # Optional: Set admin token for panel protection
