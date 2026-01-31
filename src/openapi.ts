@@ -8,7 +8,7 @@ export const openApiSpec = {
     title: 'GameFAQs Server API',
     description:
       'REST API for the GameFAQs guide archive. Lists guides and games, full-text search, health checks, and admin status.',
-    version: '1.0.0',
+    version: '1.0.1',
   },
   servers: [{ url: '/', description: 'Current host' }],
   tags: [
