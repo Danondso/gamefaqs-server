@@ -1,7 +1,7 @@
 // SQLite database schema definitions
 // Ported from gamefaqs-reader mobile app
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export const CREATE_TABLES = {
   guides: `
@@ -87,6 +87,22 @@ export const CREATE_TABLES = {
       applied_at INTEGER NOT NULL
     );
   `,
+
+  // Denormalized lookup tables for fast filter queries
+  guide_tags: `
+    CREATE TABLE IF NOT EXISTS guide_tags (
+      guide_id TEXT NOT NULL,
+      tag TEXT NOT NULL,
+      PRIMARY KEY (guide_id, tag),
+      FOREIGN KEY (guide_id) REFERENCES guides(id) ON DELETE CASCADE
+    );
+  `,
+
+  guide_platforms: `
+    CREATE TABLE IF NOT EXISTS guide_platforms (
+      platform TEXT PRIMARY KEY
+    );
+  `,
 };
 
 export const CREATE_INDEXES = {
@@ -108,6 +124,8 @@ export const CREATE_INDEXES = {
   // Fast lookup by external_id during bulk import (used in metadata JSON)
   games_external_id:
     "CREATE INDEX IF NOT EXISTS idx_games_external_id ON games(json_extract(metadata, '$.external_id'));",
+  // Index for fast tag lookups (for filtering by tag)
+  guide_tags_tag: 'CREATE INDEX IF NOT EXISTS idx_guide_tags_tag ON guide_tags(tag);',
 };
 
 // Split FTS architecture:
@@ -190,4 +208,51 @@ export const FULL_TEXT_SEARCH = {
       DELETE FROM guides_fts_content WHERE guide_id = old.id;
     END;
   `,
+};
+
+// Triggers for maintaining denormalized filter lookup tables
+export const FILTER_LOOKUP_TRIGGERS = {
+  // Insert trigger: populate guide_tags from metadata JSON
+  guide_tags_insert: `
+    CREATE TRIGGER IF NOT EXISTS guide_tags_insert AFTER INSERT ON guides
+    WHEN json_extract(new.metadata, '$.tags') IS NOT NULL
+    BEGIN
+      INSERT OR IGNORE INTO guide_tags (guide_id, tag)
+      SELECT new.id, value FROM json_each(json_extract(new.metadata, '$.tags'));
+    END;
+  `,
+
+  // Insert trigger: add platform to guide_platforms if new
+  guide_platforms_insert: `
+    CREATE TRIGGER IF NOT EXISTS guide_platforms_insert AFTER INSERT ON guides
+    WHEN json_extract(new.metadata, '$.platform') IS NOT NULL
+    BEGIN
+      INSERT OR IGNORE INTO guide_platforms (platform)
+      VALUES (json_extract(new.metadata, '$.platform'));
+    END;
+  `,
+
+  // Update trigger: refresh guide_tags when metadata changes
+  guide_tags_update: `
+    CREATE TRIGGER IF NOT EXISTS guide_tags_update AFTER UPDATE ON guides
+    WHEN old.metadata IS NOT new.metadata
+    BEGIN
+      DELETE FROM guide_tags WHERE guide_id = new.id;
+      INSERT OR IGNORE INTO guide_tags (guide_id, tag)
+      SELECT new.id, value FROM json_each(json_extract(new.metadata, '$.tags'))
+      WHERE json_extract(new.metadata, '$.tags') IS NOT NULL;
+    END;
+  `,
+
+  // Update trigger: add new platform to guide_platforms if needed
+  guide_platforms_update: `
+    CREATE TRIGGER IF NOT EXISTS guide_platforms_update AFTER UPDATE ON guides
+    WHEN old.metadata IS NOT new.metadata AND json_extract(new.metadata, '$.platform') IS NOT NULL
+    BEGIN
+      INSERT OR IGNORE INTO guide_platforms (platform)
+      VALUES (json_extract(new.metadata, '$.platform'));
+    END;
+  `,
+
+  // Delete from guide_tags handled by ON DELETE CASCADE
 };

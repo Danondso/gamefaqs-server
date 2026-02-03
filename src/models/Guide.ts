@@ -295,18 +295,18 @@ export class GuideModel implements IGuideModel {
 
     if (filters.tags && filters.tags.length > 0) {
       if (filters.tagMatch === 'all') {
-        // AND match: all tags must be present
+        // AND match: all tags must be present (use guide_tags table)
         for (const tag of filters.tags) {
           conditions.push(
-            "EXISTS (SELECT 1 FROM json_each(json_extract(metadata, '$.tags')) WHERE value = ?)"
+            'EXISTS (SELECT 1 FROM guide_tags gt WHERE gt.guide_id = guides.id AND gt.tag = ?)'
           );
           params.push(tag);
         }
       } else {
-        // OR match (default): any tag matches
+        // OR match (default): any tag matches (use guide_tags table)
         const placeholders = filters.tags.map(() => '?').join(', ');
         conditions.push(
-          `EXISTS (SELECT 1 FROM json_each(json_extract(metadata, '$.tags')) WHERE value IN (${placeholders}))`
+          `EXISTS (SELECT 1 FROM guide_tags gt WHERE gt.guide_id = guides.id AND gt.tag IN (${placeholders}))`
         );
         params.push(...filters.tags);
       }
@@ -343,21 +343,17 @@ export class GuideModel implements IGuideModel {
   }
 
   getDistinctPlatforms(): string[] {
+    // Use denormalized guide_platforms table for fast lookups
     const results = this.db.query<{ platform: string }>(
-      `SELECT DISTINCT json_extract(metadata, '$.platform') as platform
-       FROM guides
-       WHERE json_extract(metadata, '$.platform') IS NOT NULL
-       ORDER BY platform ASC`
+      `SELECT platform FROM guide_platforms ORDER BY platform ASC`
     );
     return results.map(r => r.platform).filter(Boolean);
   }
 
   getDistinctTags(): string[] {
+    // Use denormalized guide_tags table for fast lookups
     const results = this.db.query<{ tag: string }>(
-      `SELECT DISTINCT value as tag
-       FROM guides, json_each(json_extract(metadata, '$.tags'))
-       WHERE json_extract(metadata, '$.tags') IS NOT NULL
-       ORDER BY tag ASC`
+      `SELECT DISTINCT tag FROM guide_tags ORDER BY tag ASC`
     );
     return results.map(r => r.tag).filter(Boolean);
   }

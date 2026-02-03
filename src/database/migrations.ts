@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH, SCHEMA_VERSION } from './schema';
+import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH, FILTER_LOOKUP_TRIGGERS, SCHEMA_VERSION } from './schema';
 
 export interface Migration {
   version: number;
@@ -86,8 +86,59 @@ const migration_v3: Migration = {
   },
 };
 
+// Migration v4: Add denormalized lookup tables for fast filter queries
+const migration_v4: Migration = {
+  version: 4,
+  up: (db: Database.Database) => {
+    console.log('[Migrations] Creating filter lookup tables...');
+
+    // Create guide_tags and guide_platforms tables
+    db.exec(CREATE_TABLES.guide_tags);
+    db.exec(CREATE_TABLES.guide_platforms);
+
+    // Create index for tag lookups
+    db.exec(CREATE_INDEXES.guide_tags_tag);
+
+    // Populate guide_tags from existing data
+    console.log('[Migrations] Populating guide_tags from existing guides...');
+    db.exec(`
+      INSERT OR IGNORE INTO guide_tags (guide_id, tag)
+      SELECT g.id, j.value
+      FROM guides g, json_each(json_extract(g.metadata, '$.tags')) j
+      WHERE json_extract(g.metadata, '$.tags') IS NOT NULL
+    `);
+
+    // Populate guide_platforms from existing data
+    console.log('[Migrations] Populating guide_platforms from existing guides...');
+    db.exec(`
+      INSERT OR IGNORE INTO guide_platforms (platform)
+      SELECT DISTINCT json_extract(metadata, '$.platform')
+      FROM guides
+      WHERE json_extract(metadata, '$.platform') IS NOT NULL
+    `);
+
+    // Create triggers to maintain lookup tables
+    db.exec(FILTER_LOOKUP_TRIGGERS.guide_tags_insert);
+    db.exec(FILTER_LOOKUP_TRIGGERS.guide_platforms_insert);
+    db.exec(FILTER_LOOKUP_TRIGGERS.guide_tags_update);
+    db.exec(FILTER_LOOKUP_TRIGGERS.guide_platforms_update);
+
+    db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (4, ${Date.now()})`);
+    console.log('[Migrations] Filter lookup tables created and populated');
+  },
+  down: (db: Database.Database) => {
+    db.exec('DROP TRIGGER IF EXISTS guide_tags_insert');
+    db.exec('DROP TRIGGER IF EXISTS guide_platforms_insert');
+    db.exec('DROP TRIGGER IF EXISTS guide_tags_update');
+    db.exec('DROP TRIGGER IF EXISTS guide_platforms_update');
+    db.exec('DROP TABLE IF EXISTS guide_tags');
+    db.exec('DROP TABLE IF EXISTS guide_platforms');
+    db.exec('DELETE FROM schema_version WHERE version = 4');
+  },
+};
+
 // All migrations in order
-export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3];
+export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4];
 
 // Get current schema version from database
 export function getCurrentVersion(db: Database.Database): number {
