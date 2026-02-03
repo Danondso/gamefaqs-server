@@ -219,7 +219,7 @@ class OllamaService {
    * Generate a completion from Ollama
    */
   private async generate(prompt: string, content: string): Promise<string> {
-    // Longer timeout for generation (60 seconds)
+    // Longer timeout for generation (5 minutes for larger models)
     const response = await this.fetchWithTimeout(
       `${ollamaHost}/api/generate`,
       {
@@ -235,7 +235,7 @@ class OllamaService {
           },
         }),
       },
-      60000
+      300000
     );
 
     if (!response.ok) {
