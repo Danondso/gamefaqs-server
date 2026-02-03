@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import DefaultGuideModel from '../models/Guide';
 import { config } from '../config';
-import type { IGuideModel } from '../interfaces/IGuideModel';
+import type { IGuideModel, GuideFilters } from '../interfaces/IGuideModel';
 
 export interface GuidesRouterDeps {
   guideModel: IGuideModel;
@@ -25,7 +25,7 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
   const router = Router();
   const { guideModel } = deps;
 
-  // GET /api/guides - List all guides (paginated)
+  // GET /api/guides - List all guides (paginated, with optional filters)
   router.get('/', (req: Request, res: Response, next: NextFunction) => {
     try {
       const page = Math.max(1, parseInt(req.query.page as string) || 1);
@@ -35,9 +35,22 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
       );
       const offset = (page - 1) * limit;
 
-      // Use summary view (without full content) for listings
-      const guides = guideModel.findAllSummary(limit, offset);
-      const total = guideModel.getTotalCount();
+      // Parse filter parameters
+      const platform = req.query.platform as string | undefined;
+      const tagsParam = req.query.tags as string | undefined;
+      const tagMatch = req.query.tagMatch === 'all' ? 'all' : 'any';
+      const tags = tagsParam ? tagsParam.split(',').map(t => t.trim()).filter(Boolean) : undefined;
+
+      const hasFilters = platform || (tags && tags.length > 0);
+      const filters: GuideFilters = { platform, tags, tagMatch };
+
+      // Use filtered or unfiltered query based on presence of filters
+      const guides = hasFilters
+        ? guideModel.findAllSummaryFiltered(filters, limit, offset)
+        : guideModel.findAllSummary(limit, offset);
+      const total = hasFilters
+        ? guideModel.getFilteredCount(filters)
+        : guideModel.getTotalCount();
 
       res.json({
         data: guides,
@@ -47,6 +60,22 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
           total,
           totalPages: Math.ceil(total / limit),
         },
+        ...(hasFilters && { filters: { platform, tags, tagMatch } }),
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // GET /api/guides/filters - Get available filter options
+  router.get('/filters', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const platforms = guideModel.getDistinctPlatforms();
+      const tags = guideModel.getDistinctTags();
+
+      res.json({
+        platforms,
+        tags,
       });
     } catch (error) {
       next(error);

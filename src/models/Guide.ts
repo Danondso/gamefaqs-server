@@ -2,7 +2,7 @@ import { nanoid } from 'nanoid';
 import DefaultDatabase from '../database/database';
 import type { Guide, GuideMetadata } from '../types';
 import type { IDatabase } from '../interfaces/IDatabase';
-import type { IGuideModel, SearchResults } from '../interfaces/IGuideModel';
+import type { IGuideModel, SearchResults, GuideFilters } from '../interfaces/IGuideModel';
 
 interface FTSResult {
   guide_id: string;
@@ -282,6 +282,84 @@ export class GuideModel implements IGuideModel {
        FROM guides ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
       [limit, offset]
     );
+  }
+
+  private buildFilterConditions(filters: GuideFilters): { where: string; params: any[] } {
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (filters.platform) {
+      conditions.push("json_extract(metadata, '$.platform') = ?");
+      params.push(filters.platform);
+    }
+
+    if (filters.tags && filters.tags.length > 0) {
+      if (filters.tagMatch === 'all') {
+        // AND match: all tags must be present
+        for (const tag of filters.tags) {
+          conditions.push(
+            "EXISTS (SELECT 1 FROM json_each(json_extract(metadata, '$.tags')) WHERE value = ?)"
+          );
+          params.push(tag);
+        }
+      } else {
+        // OR match (default): any tag matches
+        const placeholders = filters.tags.map(() => '?').join(', ');
+        conditions.push(
+          `EXISTS (SELECT 1 FROM json_each(json_extract(metadata, '$.tags')) WHERE value IN (${placeholders}))`
+        );
+        params.push(...filters.tags);
+      }
+    }
+
+    return {
+      where: conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '',
+      params,
+    };
+  }
+
+  findAllSummaryFiltered(
+    filters: GuideFilters,
+    limit = 100,
+    offset = 0
+  ): Array<Omit<Guide, 'content'> & { content_length: number }> {
+    const { where, params } = this.buildFilterConditions(filters);
+
+    return this.db.query<Omit<Guide, 'content'> & { content_length: number }>(
+      `SELECT id, title, format, file_path, game_id, last_read_position, metadata,
+              created_at, updated_at, LENGTH(content) as content_length
+       FROM guides ${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+  }
+
+  getFilteredCount(filters: GuideFilters): number {
+    const { where, params } = this.buildFilterConditions(filters);
+    const result = this.db.get<{ count: number }>(
+      `SELECT COUNT(*) as count FROM guides ${where}`,
+      params
+    );
+    return result?.count ?? 0;
+  }
+
+  getDistinctPlatforms(): string[] {
+    const results = this.db.query<{ platform: string }>(
+      `SELECT DISTINCT json_extract(metadata, '$.platform') as platform
+       FROM guides
+       WHERE json_extract(metadata, '$.platform') IS NOT NULL
+       ORDER BY platform ASC`
+    );
+    return results.map(r => r.platform).filter(Boolean);
+  }
+
+  getDistinctTags(): string[] {
+    const results = this.db.query<{ tag: string }>(
+      `SELECT DISTINCT value as tag
+       FROM guides, json_each(json_extract(metadata, '$.tags'))
+       WHERE json_extract(metadata, '$.tags') IS NOT NULL
+       ORDER BY tag ASC`
+    );
+    return results.map(r => r.tag).filter(Boolean);
   }
 }
 

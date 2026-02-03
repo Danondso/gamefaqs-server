@@ -2,8 +2,9 @@ import { Router, Request, Response, NextFunction } from 'express';
 import DefaultGameModel from '../models/Game';
 import DefaultGuideModel from '../models/Guide';
 import { config } from '../config';
-import type { IGameModel } from '../interfaces/IGameModel';
+import type { IGameModel, GameFilters } from '../interfaces/IGameModel';
 import type { IGuideModel } from '../interfaces/IGuideModel';
+import type { Game } from '../types';
 
 export interface GamesRouterDeps {
   gameModel: IGameModel;
@@ -14,7 +15,7 @@ export function createGamesRouter(deps: GamesRouterDeps): Router {
   const router = Router();
   const { gameModel, guideModel } = deps;
 
-  // GET /api/games - List all games (paginated)
+  // GET /api/games - List all games (paginated, with optional filters)
   router.get('/', (req: Request, res: Response, next: NextFunction) => {
     try {
       const page = Math.max(1, parseInt(req.query.page as string) || 1);
@@ -24,8 +25,24 @@ export function createGamesRouter(deps: GamesRouterDeps): Router {
       );
       const offset = (page - 1) * limit;
 
-      const games = gameModel.findAll(limit, offset);
-      const total = gameModel.getTotalCount();
+      // Parse filter parameters
+      const platform = req.query.platform as string | undefined;
+      const statusParam = req.query.status as string | undefined;
+      const validStatuses: Game['status'][] = ['in_progress', 'completed', 'not_started'];
+      const status = statusParam && validStatuses.includes(statusParam as Game['status'])
+        ? (statusParam as Game['status'])
+        : undefined;
+
+      const hasFilters = platform || status;
+      const filters: GameFilters = { platform, status };
+
+      // Use filtered or unfiltered query based on presence of filters
+      const games = hasFilters
+        ? gameModel.findAllFiltered(filters, limit, offset)
+        : gameModel.findAll(limit, offset);
+      const total = hasFilters
+        ? gameModel.getFilteredCount(filters)
+        : gameModel.getTotalCount();
 
       res.json({
         data: games,
@@ -35,6 +52,22 @@ export function createGamesRouter(deps: GamesRouterDeps): Router {
           total,
           totalPages: Math.ceil(total / limit),
         },
+        ...(hasFilters && { filters: { platform, status } }),
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // GET /api/games/filters - Get available filter options
+  router.get('/filters', (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const platforms = gameModel.getDistinctPlatforms();
+      const statuses = gameModel.getDistinctStatuses();
+
+      res.json({
+        platforms,
+        statuses,
       });
     } catch (error) {
       next(error);

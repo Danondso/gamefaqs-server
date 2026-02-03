@@ -2,7 +2,7 @@ import { nanoid } from 'nanoid';
 import DefaultDatabase from '../database/database';
 import type { Game, GameMetadata } from '../types';
 import type { IDatabase } from '../interfaces/IDatabase';
-import type { IGameModel } from '../interfaces/IGameModel';
+import type { IGameModel, GameFilters } from '../interfaces/IGameModel';
 
 export class GameModel implements IGameModel {
   constructor(private db: IDatabase = DefaultDatabase) {}
@@ -193,6 +193,58 @@ export class GameModel implements IGameModel {
       [externalId]
     );
     return result ?? null;
+  }
+
+  private buildFilterConditions(filters: GameFilters): { where: string; params: any[] } {
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (filters.platform) {
+      conditions.push('platform = ?');
+      params.push(filters.platform);
+    }
+
+    if (filters.status) {
+      conditions.push('status = ?');
+      params.push(filters.status);
+    }
+
+    return {
+      where: conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '',
+      params,
+    };
+  }
+
+  findAllFiltered(filters: GameFilters, limit = 100, offset = 0): Game[] {
+    const { where, params } = this.buildFilterConditions(filters);
+
+    return this.db.query<Game>(
+      `SELECT * FROM games ${where} ORDER BY title ASC LIMIT ? OFFSET ?`,
+      [...params, limit, offset]
+    );
+  }
+
+  getFilteredCount(filters: GameFilters): number {
+    const { where, params } = this.buildFilterConditions(filters);
+    const result = this.db.get<{ count: number }>(
+      `SELECT COUNT(*) as count FROM games ${where}`,
+      params
+    );
+    return result?.count ?? 0;
+  }
+
+  getDistinctPlatforms(): string[] {
+    const results = this.db.query<{ platform: string }>(
+      `SELECT DISTINCT platform FROM games WHERE platform IS NOT NULL ORDER BY platform ASC`
+    );
+    return results.map(r => r.platform).filter(Boolean);
+  }
+
+  getDistinctStatuses(): Game['status'][] {
+    const results = this.db.query<{ status: Game['status'] }>(
+      `SELECT DISTINCT status FROM games ORDER BY status ASC`
+    );
+    return results.map(r => r.status);
   }
 }
 

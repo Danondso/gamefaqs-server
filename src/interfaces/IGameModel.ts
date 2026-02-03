@@ -1,5 +1,10 @@
 import type { Game, GameMetadata } from '../types';
 
+export interface GameFilters {
+  platform?: string;
+  status?: Game['status'];
+}
+
 export interface IGameModel {
   create(data: Omit<Game, 'id' | 'created_at' | 'updated_at' | 'completion_percentage' | 'status'> & {
     completion_percentage?: number;
@@ -25,4 +30,8 @@ export interface IGameModel {
     status?: Game['status'];
   }>): void;
   findByExternalId(externalId: string): Game | null;
+  findAllFiltered(filters: GameFilters, limit?: number, offset?: number): Game[];
+  getFilteredCount(filters: GameFilters): number;
+  getDistinctPlatforms(): string[];
+  getDistinctStatuses(): Game['status'][];
 }

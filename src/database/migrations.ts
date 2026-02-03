@@ -69,8 +69,25 @@ const migration_v2: Migration = {
   },
 };
 
+// Migration v3: Add indexes for platform filtering
+const migration_v3: Migration = {
+  version: 3,
+  up: (db: Database.Database) => {
+    // Add index on guides metadata platform for filtering
+    db.exec("CREATE INDEX IF NOT EXISTS idx_guides_metadata_platform ON guides(json_extract(metadata, '$.platform'));");
+    // Add index on games platform for filtering
+    db.exec('CREATE INDEX IF NOT EXISTS idx_games_platform ON games(platform);');
+    db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (3, ${Date.now()})`);
+  },
+  down: (db: Database.Database) => {
+    db.exec('DROP INDEX IF EXISTS idx_guides_metadata_platform');
+    db.exec('DROP INDEX IF EXISTS idx_games_platform');
+    db.exec('DELETE FROM schema_version WHERE version = 3');
+  },
+};
+
 // All migrations in order
-export const migrations: Migration[] = [migration_v1, migration_v2];
+export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3];
 
 // Get current schema version from database
 export function getCurrentVersion(db: Database.Database): number {

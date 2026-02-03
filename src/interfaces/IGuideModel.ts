@@ -5,6 +5,12 @@ export interface SearchResults {
   content: Guide[];
 }
 
+export interface GuideFilters {
+  platform?: string;
+  tags?: string[];
+  tagMatch?: 'any' | 'all';
+}
+
 export interface IGuideModel {
   create(data: Omit<Guide, 'id' | 'created_at' | 'updated_at'>): Guide;
   findById(id: string): Guide | null;
@@ -25,4 +31,8 @@ export interface IGuideModel {
   findMissingSummary(limit?: number): Guide[];
   findAllWithGames(): Array<{ guide: Guide; game: any | null }>;
   findAllSummary(limit?: number, offset?: number): Array<Omit<Guide, 'content'> & { content_length: number }>;
+  findAllSummaryFiltered(filters: GuideFilters, limit?: number, offset?: number): Array<Omit<Guide, 'content'> & { content_length: number }>;
+  getFilteredCount(filters: GuideFilters): number;
+  getDistinctPlatforms(): string[];
+  getDistinctTags(): string[];
 }
