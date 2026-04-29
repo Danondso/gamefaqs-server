@@ -10,13 +10,18 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "docker:build": "docker build -t gamefaqs-server .",
-    "docker:run": "docker-compose up"
+    "docker:run": "docker-compose up",
+    "mcp": "ts-node src/mcp-server.ts",
+    "mcp:start": "node dist/mcp-server.js",
+    "mcp:bundle": "esbuild src/mcp-server.ts --bundle --platform=node --target=node20 --format=cjs --external:better-sqlite3 --outfile=dist/mcp-server.js",
+    "docker:mcp:build": "docker build -f Dockerfile.mcp -t gamefaqs-mcp ."
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "A REST API server that hosts the complete GameFAQs guide archive. On first startup, the server automatically downloads the archive from Internet Archive (~2.2GB), extracts it, and imports all guides to SQLite. The server provides REST API endpoints for the mobile app plus a web-based admin panel for monitoring and management.",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0",
     "axios": "^1.13.4",
     "better-sqlite3": "^12.6.2",
     "cors": "^2.8.6",
@@ -36,6 +41,7 @@
     "@types/swagger-ui-express": "^4.1.8",
     "@types/yauzl": "^2.10.3",
     "@vitest/coverage-v8": "^4.0.18",
+    "esbuild": "^0.28.0",
     "nodemon": "^3.1.11",
     "supertest": "^7.2.2",
     "ts-node": "^10.9.2",

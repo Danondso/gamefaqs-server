@@ -72,6 +72,9 @@ ADMIN_TOKEN=                  # Token to protect admin panel (empty = open acces
 # Ollama AI Integration (optional)
 OLLAMA_HOST=http://localhost:11434
 OLLAMA_MODEL=llama3.2
+
+# MCP Server (optional)
+GAMEFAQS_API_URL=             # If set, MCP server proxies to this REST API instead of opening the local DB
 ```
 
 ## First Startup Behavior
@@ -210,6 +213,67 @@ services:
     mem_limit: 2G
     mem_reservation: 512M
 ```
+
+## MCP Server
+
+An MCP (Model Context Protocol) server is included so AI assistants can search and read the archive directly. It exposes six tools: `search_guides`, `search_games`, `read_guide`, `get_game`, `browse_guides`, and `get_archive_stats`.
+
+**Run modes:**
+
+```bash
+# Local mode — opens the SQLite DB directly (DB_PATH must be readable)
+npm run mcp
+
+# Remote mode — proxies all reads to a running gamefaqs-server REST API.
+# Useful when the MCP host doesn't have the ~5-10GB database locally.
+GAMEFAQS_API_URL=http://your-server:3000 npm run mcp
+```
+
+In remote mode the MCP process never opens SQLite, so it works on machines without `DB_PATH`. The remote server's `/api/guides` and `/api/games` endpoints are unauthenticated, so no token is required even when `ADMIN_TOKEN` is set on the remote box.
+
+**Production build:**
+```bash
+npm run build
+GAMEFAQS_API_URL=http://your-server:3000 npm run mcp:start
+```
+
+### Docker
+
+A separate `Dockerfile.mcp` builds an image that runs the MCP server over stdio. No port is exposed; the AI client launches `docker run` and pipes stdin/stdout.
+
+```bash
+# Build once
+npm run docker:mcp:build
+
+# Remote mode — point at a running gamefaqs-server. No volume needed.
+docker run --rm -i \
+  -e GAMEFAQS_API_URL=http://your-server:3000 \
+  gamefaqs-mcp
+
+# Local mode — share the SQLite volume with the main server container.
+docker run --rm -i \
+  -v gamefaqs-data:/data/db \
+  gamefaqs-mcp
+```
+
+**Wiring into an MCP client (e.g. Claude Desktop):**
+
+```json
+{
+  "mcpServers": {
+    "gamefaqs": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "GAMEFAQS_API_URL=http://your-server:3000",
+        "gamefaqs-mcp"
+      ]
+    }
+  }
+}
+```
+
+The `-i` flag is required (stdin must stay open). Don't add `-t`; the AI client isn't a TTY.
 
 ## Related Projects
 

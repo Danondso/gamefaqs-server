@@ -15,6 +15,10 @@ export const config = {
   // Admin panel security (optional)
   adminToken: process.env.ADMIN_TOKEN, // Set to protect admin panel
 
+  // MCP server: when set, the MCP server proxies to this REST API instead of opening the local DB.
+  // Example: GAMEFAQS_API_URL=http://my-server:3000
+  mcpApiUrl: process.env.GAMEFAQS_API_URL,
+
   // Ollama AI integration (optional)
   ollamaHost: process.env.OLLAMA_HOST || 'http://localhost:11434',
   ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2',

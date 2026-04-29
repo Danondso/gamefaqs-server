@@ -15,6 +15,9 @@ npm run build            # Compile TypeScript to dist/
 npm start                # Run production server (dist/server.js)
 npm run docker:build     # Build Docker image
 npm run docker:run       # Start with docker-compose
+npm run mcp              # Run MCP server (stdio) against local SQLite
+npm run mcp:start        # Run compiled MCP server (dist/mcp-server.js)
+npm run docker:mcp:build # Build MCP server Docker image (Dockerfile.mcp)
 ```
 
 ## Architecture
@@ -34,6 +37,8 @@ npm run docker:run       # Start with docker-compose
 
 **Routes (`src/routes/`)**: Express routers for `/api/health`, `/api/guides`, `/api/games`, `/api/admin`
 
+**MCP Server (`src/mcp-server.ts`)**: Separate stdio entry point exposing archive search/read tools to AI assistants. Has two modes selected by `GAMEFAQS_API_URL`: unset → opens local SQLite via `Database.initialize` and uses models directly; set → skips DB init and proxies all reads through the REST API of a running server. Both modes go through the same `ds*` wrapper functions so tool handlers stay mode-agnostic.
+
 ### Key Patterns
 
 - **Error Handling**: Use `next(error)` in route handlers; custom errors need `statusCode` and `code` properties
@@ -52,9 +57,10 @@ Schema changes require migrations in `src/database/migrations.ts`.
 
 ```bash
 PORT=3000                    # HTTP port
-DB_PATH=/data/db/gamefaqs.db # SQLite database path
-ADMIN_TOKEN=                 # Optional admin authentication
+DB_PATH=/data/db/gamefaqs.db # SQLite database path (ignored by MCP server in remote mode)
+ADMIN_TOKEN=                 # Optional admin authentication (gates /api/admin/* only)
 OLLAMA_HOST=http://localhost:11434  # Optional AI integration
+GAMEFAQS_API_URL=            # Optional — when set, MCP server proxies to this REST API instead of opening local DB
 ```
 
 ## Development Notes
