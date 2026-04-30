@@ -17,6 +17,10 @@ services:
       - PORT=3000
       - DB_PATH=/data/db/gamefaqs.db
       - TEMP_DIR=/tmp/gamefaqs
+      # Set to "true" to keep gamefaqs_archive.zip after extraction so a future
+      # fresh setup can reuse it instead of re-downloading ~12 GB. Default
+      # deletes it after extract to free disk during import.
+      - KEEP_ARCHIVE=false
       # Optional: Set admin token for panel protection
       - ADMIN_TOKEN=your-secret-token
       # Optional: Ollama integration for AI-powered metadata

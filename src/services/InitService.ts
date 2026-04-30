@@ -60,20 +60,38 @@ class InitService {
       this.updateStatus('downloading', 0, 'Downloading archive from Internet Archive...');
       const archivePath = path.join(config.tempDir, 'gamefaqs_archive.zip');
 
-      await ArchiveDownloadService.downloadArchive(
-        config.archiveUrl,
-        archivePath,
-        (progress) => {
-          const percentage = Math.floor(progress.percentage * 0.3);
-          const downloaded = (progress.downloaded / 1024 / 1024).toFixed(1);
-          const total = progress.total > 0 
-            ? (progress.total / 1024 / 1024).toFixed(1)
-            : '?';
-          this.updateStatus('downloading', percentage, `Downloading: ${downloaded}MB / ${total}MB`);
+      // Reuse a previously-kept archive if it's already on disk and matches
+      // the remote Content-Length. Saves a ~12 GB re-download for users who
+      // ran with KEEP_ARCHIVE=true on a prior setup.
+      let skipDownload = false;
+      if (fs.existsSync(archivePath)) {
+        const localSize = fs.statSync(archivePath).size;
+        const remoteSize = await ArchiveDownloadService.getRemoteSize(config.archiveUrl);
+        if (remoteSize !== null && localSize === remoteSize) {
+          console.log(`[Init] Found existing archive at ${archivePath} (${(localSize / 1024 / 1024).toFixed(1)} MB) — skipping download`);
+          this.updateStatus('downloading', 30, 'Reusing existing archive');
+          skipDownload = true;
+        } else {
+          console.log(`[Init] Existing archive size mismatch (local ${localSize}, remote ${remoteSize ?? 'unknown'}) — re-downloading`);
+          try { fs.unlinkSync(archivePath); } catch { /* fall through */ }
         }
-      );
+      }
 
-      console.log('[Init] Download complete');
+      if (!skipDownload) {
+        await ArchiveDownloadService.downloadArchive(
+          config.archiveUrl,
+          archivePath,
+          (progress) => {
+            const percentage = Math.floor(progress.percentage * 0.3);
+            const downloaded = (progress.downloaded / 1024 / 1024).toFixed(1);
+            const total = progress.total > 0
+              ? (progress.total / 1024 / 1024).toFixed(1)
+              : '?';
+            this.updateStatus('downloading', percentage, `Downloading: ${downloaded}MB / ${total}MB`);
+          }
+        );
+        console.log('[Init] Download complete');
+      }
 
       // Stage 2: Extract archives (30% of progress, offset 30)
       this.updateStatus('extracting', 30, 'Extracting ZIP and 7z archives...');
@@ -95,12 +113,18 @@ class InitService {
 
       console.log('[Init] Extraction complete');
 
-      // Delete original archive to save space
-      console.log('[Init] Deleting archive to free space...');
-      try {
-        fs.unlinkSync(archivePath);
-      } catch (err) {
-        console.warn('[Init] Could not delete archive:', err);
+      // Free the ~12 GB archive unless the operator opted to keep it for
+      // future setups. Keeping is useful if you anticipate yeeting the DB
+      // and don't want to re-download.
+      if (config.keepArchive) {
+        console.log(`[Init] Keeping archive at ${archivePath} (KEEP_ARCHIVE=true)`);
+      } else {
+        console.log('[Init] Deleting archive to free space (set KEEP_ARCHIVE=true to retain)...');
+        try {
+          fs.unlinkSync(archivePath);
+        } catch (err) {
+          console.warn('[Init] Could not delete archive:', err);
+        }
       }
 
       // Stage 3: Import guides (40% of progress, offset 60)
@@ -164,6 +188,13 @@ class InitService {
     }
   }
 
+  // Track what we last printed so progress stages don't spam the log: SSE
+  // listeners still get every update, but stdout only sees one line per
+  // integer percentage tick (Docker logs) or in-place updates (TTY).
+  private lastLoggedStage: InitStatus['stage'] | null = null;
+  private lastLoggedProgress = -1;
+  private progressLineActive = false;
+
   private updateStatus(
     stage: InitStatus['stage'],
     progress: number,
@@ -180,7 +211,39 @@ class InitService {
       gameCount: gameCount ?? this.status.gameCount,
     };
     this.notifyListeners();
-    console.log(`[Init] ${message} (${progress}%)`);
+    this.logProgress(stage, progress, message);
+  }
+
+  private logProgress(stage: InitStatus['stage'], progress: number, message: string): void {
+    const isProgressStage = stage === 'downloading' || stage === 'extracting' || stage === 'importing';
+    const stageChanged = stage !== this.lastLoggedStage;
+
+    // Close out an in-progress \r line before emitting anything new.
+    if (stageChanged && this.progressLineActive) {
+      process.stdout.write('\n');
+      this.progressLineActive = false;
+    }
+
+    if (!isProgressStage) {
+      console.log(`[Init] ${message} (${progress}%)`);
+      this.lastLoggedStage = stage;
+      this.lastLoggedProgress = -1;
+      return;
+    }
+
+    // Skip duplicate ticks within a progress stage.
+    if (!stageChanged && progress === this.lastLoggedProgress) return;
+
+    const line = `[Init] ${message} (${progress}%)`;
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\r\x1b[K${line}`);
+      this.progressLineActive = true;
+    } else {
+      console.log(line);
+    }
+
+    this.lastLoggedStage = stage;
+    this.lastLoggedProgress = progress;
   }
 
   getStatus(): InitStatus {

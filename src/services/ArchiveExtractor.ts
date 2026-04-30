@@ -58,12 +58,13 @@ class ArchiveExtractor {
           currentArchiveProgress: 0,
         });
 
-        console.log(`[Extraction] Extracting 7z archive ${i + 1}/${sevenZipArchives.length}:`, archiveName);
+        // Per-archive progress is already surfaced via updateProgress → InitService's
+        // throttled [Init] log; no per-archive console line needed here.
 
         try {
           await this.extract7zArchive(sevenZipPath, outputDir);
         } catch (error) {
-          console.error('[Extraction] Error extracting 7z archive:', error);
+          console.error('[Extraction] Error extracting 7z archive:', archiveName, error);
           this.updateProgress({
             error: `Failed to extract ${archiveName}: ${error}`,
           });
@@ -72,9 +73,8 @@ class ArchiveExtractor {
         // Delete the 7z archive after extraction to save space
         try {
           fs.unlinkSync(sevenZipPath);
-          console.log('[Extraction] Deleted 7z archive:', archiveName);
         } catch (err) {
-          console.warn('[Extraction] Could not delete 7z archive:', err);
+          console.warn('[Extraction] Could not delete 7z archive:', archiveName, err);
         }
       }
 
@@ -158,7 +158,6 @@ class ArchiveExtractor {
 
             writeStream.on('finish', () => {
               sevenZipArchives.push(fullPath);
-              console.log('[ZIP] Extracted:', relativePath);
               zipfile.readEntry();
             });
 
@@ -187,7 +186,9 @@ class ArchiveExtractor {
    */
   private extract7zArchive(sevenZipPath: string, outputDir: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      console.log('[7z] Extracting:', sevenZipPath);
+      // Per-archive start/end + per-100-file ticks would emit thousands of
+      // lines across the full import; the InitService [Init] log is throttled
+      // and surfaces per-archive progress via updateProgress below.
 
       const extractStream = Seven.extractFull(sevenZipPath, outputDir, {
         $progress: true,
@@ -198,9 +199,6 @@ class ArchiveExtractor {
 
       extractStream.on('data', () => {
         extractedCount++;
-        if (extractedCount % 100 === 0) {
-          console.log(`[7z] Extracted ${extractedCount} files...`);
-        }
       });
 
       extractStream.on('progress', (progress: { percent?: number }) => {
@@ -210,7 +208,6 @@ class ArchiveExtractor {
       });
 
       extractStream.on('end', () => {
-        console.log('[7z] Extraction complete. Extracted', extractedCount, 'files');
         resolve();
       });
 

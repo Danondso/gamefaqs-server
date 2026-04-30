@@ -11,6 +11,10 @@ export const config = {
   // Archive settings
   archiveUrl: process.env.ARCHIVE_URL || 'https://archive.org/compress/Gamespot_Gamefaqs_TXTs/formats=7Z&file=/Gamespot_Gamefaqs_TXTs.zip',
   tempDir: process.env.TEMP_DIR || '/tmp/gamefaqs',
+  // Set KEEP_ARCHIVE=true to retain gamefaqs_archive.zip after extraction so a
+  // future fresh setup can skip the ~12 GB download. Default deletes it after
+  // extract to free disk during import.
+  keepArchive: process.env.KEEP_ARCHIVE === 'true',
 
   // Admin panel security (optional)
   adminToken: process.env.ADMIN_TOKEN, // Set to protect admin panel
