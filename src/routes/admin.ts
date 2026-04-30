@@ -3,6 +3,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import InitService from '../services/InitService';
 import OllamaService from '../services/OllamaService';
+import { EmbeddingService } from '../services/EmbeddingService';
+import { IndexingService } from '../services/IndexingService';
 import GuideModel from '../models/Guide';
 import GameModel from '../models/Game';
 import Database from '../database/database';
@@ -10,6 +12,15 @@ import { config } from '../config';
 import type { GuideMetadata, Guide } from '../types';
 
 const router = Router();
+
+// Shared singletons for the RAG indexer. Constructed once so admin endpoints
+// see consistent progress across requests.
+const embeddingService = new EmbeddingService({
+  host: config.embeddingHost,
+  model: config.embeddingModel,
+  dim: config.embeddingDim,
+});
+const indexingService = new IndexingService({ embeddingService });
 
 // Login page shown when ADMIN_TOKEN is set but request has no valid token
 const loginPageHtml = `
@@ -544,6 +555,99 @@ router.get('/ai/yolo/stream', (req: Request, res: Response) => {
   req.on('close', () => {
     console.log('[Admin] YOLO SSE disconnected');
     clearInterval(keepaliveInterval);
+    unsubscribe();
+  });
+});
+
+// ========== RAG Indexing Endpoints ==========
+
+// POST /api/admin/ai/index/start - Start background chunk + embedding indexer
+router.post('/ai/index/start', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (indexingService.isRunning()) {
+      res.status(409).json({ error: 'Indexing already in progress' });
+      return;
+    }
+
+    const limitParam = req.query.limit as string | undefined;
+    const force = req.query.force === 'true';
+    const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+    if (limitParam && (Number.isNaN(limit!) || limit! <= 0)) {
+      res.status(400).json({ error: 'limit must be a positive integer' });
+      return;
+    }
+
+    const availability = await embeddingService.checkAvailability();
+    if (!availability.available) {
+      res.status(503).json({
+        error: 'Embedding service unavailable',
+        details: availability.error,
+      });
+      return;
+    }
+
+    res.status(202).json({
+      success: true,
+      message: 'Indexing starting...',
+      embeddingHost: embeddingService.getHost(),
+      embeddingModel: embeddingService.getModel(),
+      vectorSearchAvailable: Database.vectorSearchAvailable,
+    });
+
+    console.log(`[Admin] Starting indexing (limit=${limit ?? 'none'}, force=${force})`);
+    indexingService.start({ limit, force }).catch(err => {
+      console.error('[Admin] Indexing start failed:', err);
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/admin/ai/index/stop - Request graceful stop
+router.post('/ai/index/stop', (req: Request, res: Response) => {
+  if (!indexingService.isRunning()) {
+    res.status(400).json({ error: 'Indexing not running' });
+    return;
+  }
+  indexingService.stop();
+  res.json({ success: true, message: 'Indexing stop requested' });
+});
+
+// GET /api/admin/ai/index/status - Snapshot of indexer state
+router.get('/ai/index/status', (req: Request, res: Response) => {
+  res.json({
+    progress: indexingService.getProgress(),
+    embeddingHost: embeddingService.getHost(),
+    embeddingModel: embeddingService.getModel(),
+    vectorSearchAvailable: Database.vectorSearchAvailable,
+  });
+});
+
+// GET /api/admin/ai/index/stream - SSE stream of indexer progress
+router.get('/ai/index/stream', (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Content-Encoding', 'none');
+  res.flushHeaders();
+
+  const sendProgress = (progress: any) => {
+    res.write(`data: ${JSON.stringify(progress)}\n\n`);
+    if (typeof (res as any).flush === 'function') {
+      (res as any).flush();
+    }
+  };
+
+  sendProgress(indexingService.getProgress());
+  const unsubscribe = indexingService.onProgressChange(sendProgress);
+
+  const keepalive = setInterval(() => {
+    res.write(`: keepalive\n\n`);
+  }, 5000);
+
+  req.on('close', () => {
+    clearInterval(keepalive);
     unsubscribe();
   });
 });

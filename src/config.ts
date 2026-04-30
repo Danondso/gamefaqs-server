@@ -23,6 +23,18 @@ export const config = {
   ollamaHost: process.env.OLLAMA_HOST || 'http://localhost:11434',
   ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2',
 
+  // RAG / answer feature
+  embeddingHost: process.env.EMBEDDING_OLLAMA_HOST || process.env.OLLAMA_HOST || 'http://localhost:11434',
+  embeddingModel: process.env.EMBEDDING_MODEL || 'nomic-embed-text',
+  embeddingDim: parseInt(process.env.EMBEDDING_DIM || '768', 10),
+  synthesisHost: process.env.SYNTHESIS_OLLAMA_HOST || process.env.OLLAMA_HOST || 'http://localhost:11434',
+  synthesisModel: process.env.SYNTHESIS_MODEL || 'qwen2.5:7b-instruct',
+  chunkSizeTokens: parseInt(process.env.CHUNK_SIZE_TOKENS || '800', 10),
+  chunkOverlapTokens: parseInt(process.env.CHUNK_OVERLAP_TOKENS || '100', 10),
+  vectorSearchEnabled: process.env.VECTOR_SEARCH_ENABLED !== 'false',
+  ragTopK: parseInt(process.env.RAG_TOP_K || '8', 10),
+  answerRateLimitPerMin: parseInt(process.env.ANSWER_RATE_LIMIT || '10', 10),
+
   // Pagination
   maxPageSize: 100,
   defaultPageSize: 20,

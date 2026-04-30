@@ -1,10 +1,15 @@
 import Database from 'better-sqlite3';
-import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH, FILTER_LOOKUP_TRIGGERS, SCHEMA_VERSION } from './schema';
+import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH, FILTER_LOOKUP_TRIGGERS, RAG_DDL, SCHEMA_VERSION } from './schema';
+import { config } from '../config';
+
+export interface MigrationContext {
+  vectorSearchAvailable: boolean;
+}
 
 export interface Migration {
   version: number;
-  up: (db: Database.Database) => void;
-  down?: (db: Database.Database) => void;
+  up: (db: Database.Database, ctx: MigrationContext) => void;
+  down?: (db: Database.Database, ctx: MigrationContext) => void;
 }
 
 // Migration v1: Initial schema
@@ -137,8 +142,54 @@ const migration_v4: Migration = {
   },
 };
 
+// Migration v5: Add chunks table, FTS5 chunk index, and (optionally) vec0 embeddings table for RAG
+const migration_v5: Migration = {
+  version: 5,
+  up: (db: Database.Database, ctx: MigrationContext) => {
+    console.log('[Migrations] Adding RAG schema (chunks + FTS + embeddings)...');
+
+    // guides.indexed_at: per-guide checkpoint for the indexer
+    db.exec('ALTER TABLE guides ADD COLUMN indexed_at INTEGER');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_guides_indexed_at ON guides(indexed_at)');
+
+    db.exec(CREATE_TABLES.chunks);
+    db.exec(CREATE_INDEXES.chunks_guide_id);
+
+    // FTS5 is built into SQLite — always available
+    db.exec(RAG_DDL.chunksFts);
+    db.exec(RAG_DDL.chunksFtsInsert);
+    db.exec(RAG_DDL.chunksFtsDelete);
+
+    if (ctx.vectorSearchAvailable) {
+      db.exec(RAG_DDL.chunkEmbeddings(config.embeddingDim));
+      console.log(`[Migrations] Created chunk_embeddings vec0 table (dim=${config.embeddingDim})`);
+    } else {
+      console.warn('[Migrations] sqlite-vec unavailable — skipping chunk_embeddings; vector search will be disabled until the extension loads');
+    }
+
+    db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (5, ${Date.now()})`);
+    console.log('[Migrations] RAG schema applied');
+  },
+  down: (db: Database.Database) => {
+    db.exec('DROP TRIGGER IF EXISTS chunks_fts_delete');
+    db.exec('DROP TRIGGER IF EXISTS chunks_fts_insert');
+    db.exec('DROP TABLE IF EXISTS chunks_fts');
+    db.exec('DROP TABLE IF EXISTS chunk_embeddings');
+    db.exec('DROP INDEX IF EXISTS idx_chunks_guide_id');
+    db.exec('DROP TABLE IF EXISTS chunks');
+    db.exec('DROP INDEX IF EXISTS idx_guides_indexed_at');
+    // SQLite 3.35+ supports DROP COLUMN
+    try {
+      db.exec('ALTER TABLE guides DROP COLUMN indexed_at');
+    } catch (err: any) {
+      console.warn('[Migrations] Could not drop column indexed_at (older SQLite?):', err.message);
+    }
+    db.exec('DELETE FROM schema_version WHERE version = 5');
+  },
+};
+
 // All migrations in order
-export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4];
+export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5];
 
 // Get current schema version from database
 export function getCurrentVersion(db: Database.Database): number {
@@ -154,7 +205,10 @@ export function getCurrentVersion(db: Database.Database): number {
 }
 
 // Run all pending migrations
-export function runMigrations(db: Database.Database): void {
+export function runMigrations(
+  db: Database.Database,
+  ctx: MigrationContext = { vectorSearchAvailable: false }
+): void {
   const currentVersion = getCurrentVersion(db);
 
   console.log(`[Migrations] Current database version: ${currentVersion}`);
@@ -179,7 +233,7 @@ export function runMigrations(db: Database.Database): void {
   pendingMigrations.forEach(migration => {
     console.log(`[Migrations] Applying migration v${migration.version}...`);
     try {
-      migration.up(db);
+      migration.up(db, ctx);
       console.log(`[Migrations] Migration v${migration.version} applied successfully`);
     } catch (error) {
       console.error(`[Migrations] Failed to apply migration v${migration.version}:`, error);
@@ -195,7 +249,11 @@ export function runMigrations(db: Database.Database): void {
  * SECURITY: Never expose this function to user input (e.g. HTTP request).
  * It uses string interpolation for targetVersion; if called with untrusted input, SQL injection is possible.
  */
-export function rollbackTo(db: Database.Database, targetVersion: number): void {
+export function rollbackTo(
+  db: Database.Database,
+  targetVersion: number,
+  ctx: MigrationContext = { vectorSearchAvailable: false }
+): void {
   const currentVersion = getCurrentVersion(db);
 
   if (targetVersion >= currentVersion) {
@@ -214,7 +272,7 @@ export function rollbackTo(db: Database.Database, targetVersion: number): void {
       throw new Error(`Migration v${migration.version} does not have a rollback function`);
     }
     console.log(`[Migrations] Rolling back migration v${migration.version}...`);
-    migration.down(db);
+    migration.down(db, ctx);
   });
 
   // Update version

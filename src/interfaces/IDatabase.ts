@@ -9,4 +9,5 @@ export interface IDatabase {
   transaction<T>(fn: () => T): T;
   close(): void;
   getDb(): Database.Database;
+  vectorSearchAvailable: boolean;
 }

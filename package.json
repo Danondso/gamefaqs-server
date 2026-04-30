@@ -29,6 +29,7 @@
     "nanoid": "^5.1.6",
     "node-7z": "^3.0.0",
     "ollama": "^0.6.3",
+    "sqlite-vec": "^0.1.9",
     "swagger-ui-express": "^5.0.1",
     "yauzl": "^3.2.0"
   },

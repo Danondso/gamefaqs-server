@@ -4,9 +4,11 @@ import * as fs from 'fs';
 import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH } from './schema';
 import { runMigrations } from './migrations';
 import type { IDatabase } from '../interfaces/IDatabase';
+import { config } from '../config';
 
 export class DatabaseService implements IDatabase {
   private db: Database.Database | null = null;
+  vectorSearchAvailable = false;
 
   initialize(dbPath: string): void {
     // Ensure directory exists
@@ -26,6 +28,10 @@ export class DatabaseService implements IDatabase {
     // WAL mode: better for large imports, reduces peak disk usage
     this.db.pragma('journal_mode = WAL');
 
+    // Best-effort load of sqlite-vec for vector search (must run before migrations
+    // so v5 can decide whether to create the chunk_embeddings vec0 virtual table)
+    this.loadVectorExtension();
+
     // Apply schema
     this.applySchema();
 
@@ -41,6 +47,8 @@ export class DatabaseService implements IDatabase {
     // Enable foreign keys
     this.db.pragma('foreign_keys = ON');
 
+    this.loadVectorExtension();
+
     // Apply schema
     this.applySchema();
 
@@ -50,11 +58,33 @@ export class DatabaseService implements IDatabase {
     }
   }
 
+  private loadVectorExtension(): void {
+    if (!this.db) return;
+    if (!config.vectorSearchEnabled) {
+      this.vectorSearchAvailable = false;
+      return;
+    }
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const sqliteVec = require('sqlite-vec');
+      sqliteVec.load(this.db);
+      this.vectorSearchAvailable = true;
+      if (process.env.NODE_ENV !== 'test') {
+        console.log('[Database] sqlite-vec extension loaded');
+      }
+    } catch (err: any) {
+      this.vectorSearchAvailable = false;
+      if (process.env.NODE_ENV !== 'test') {
+        console.warn('[Database] sqlite-vec failed to load, vector search disabled:', err.message);
+      }
+    }
+  }
+
   private applySchema(): void {
     if (!this.db) throw new Error('Database not initialized');
 
     // Run migrations (handles both new and existing databases)
-    runMigrations(this.db);
+    runMigrations(this.db, { vectorSearchAvailable: this.vectorSearchAvailable });
 
     if (process.env.NODE_ENV !== 'test') {
       console.log('[Database] Schema applied');
