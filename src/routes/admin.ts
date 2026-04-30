@@ -617,6 +617,7 @@ router.post('/ai/index/stop', (req: Request, res: Response) => {
 router.get('/ai/index/status', (req: Request, res: Response) => {
   res.json({
     progress: indexingService.getProgress(),
+    db: indexingService.getDbStats(),
     embeddingHost: embeddingService.getHost(),
     embeddingModel: embeddingService.getModel(),
     vectorSearchAvailable: Database.vectorSearchAvailable,
@@ -1678,6 +1679,24 @@ router.get('/panel', (req: Request, res: Response) => {
     let indexEventSource = null;
     let indexStarted = false;
     let indexMetaText = '';
+    // Snapshot of persistent DB counts. Refreshed on page load and after each run
+    // ends — during a run we add progress.processedGuides on top of this snapshot
+    // to compute cumulative position without round-tripping per SSE event.
+    let indexDbStats = { totalGuides: 0, indexedGuides: 0, totalChunks: 0 };
+
+    function refreshIndexDbStats() {
+      return fetch('/api/admin/ai/index/status' + authSuffix)
+        .then(r => r.json())
+        .then(data => {
+          if (data.db) indexDbStats = data.db;
+          return data;
+        })
+        .catch(() => null);
+    }
+
+    function formatCount(n) {
+      return (n || 0).toLocaleString();
+    }
 
     function connectIndexSSE() {
       if (indexEventSource) indexEventSource.close();
@@ -1713,27 +1732,45 @@ router.get('/panel', (req: Request, res: Response) => {
 
       if (isRunning) indexStarted = true;
 
-      // Stats
-      document.getElementById('indexProcessed').textContent = progress.processedGuides || 0;
-      document.getElementById('indexSucceeded').textContent = progress.succeededGuides || 0;
-      document.getElementById('indexFailed').textContent = progress.failedGuides || 0;
-      document.getElementById('indexChunks').textContent = progress.totalChunks || 0;
+      // Per-run stats (current session only — reset on each start)
+      document.getElementById('indexProcessed').textContent = formatCount(progress.processedGuides);
+      document.getElementById('indexSucceeded').textContent = formatCount(progress.succeededGuides);
+      document.getElementById('indexFailed').textContent = formatCount(progress.failedGuides);
+      document.getElementById('indexChunks').textContent = formatCount(progress.totalChunks);
 
-      // Progress bar — known total when running, else fill on complete
-      const total = progress.totalGuides || 0;
-      const done = progress.processedGuides || 0;
-      const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : (isComplete ? 100 : 0);
+      // Cumulative position: snapshot at page-load + this run's increments.
+      // (processedGuides resets on each start, so no double-counting.)
+      const cumulativeIndexed = indexDbStats.indexedGuides + (isRunning ? (progress.processedGuides || 0) : 0);
+      const cumulativeTotal = indexDbStats.totalGuides;
+      const pct = cumulativeTotal > 0
+        ? Math.min(100, Math.round((cumulativeIndexed / cumulativeTotal) * 100))
+        : 0;
       progressBar.style.width = pct + '%';
 
-      metaDiv.textContent = indexMetaText;
+      // Meta line: cumulative archive coverage + embedding host/model.
+      const coverageText = cumulativeTotal > 0
+        ? formatCount(cumulativeIndexed) + ' of ' + formatCount(cumulativeTotal) +
+          ' guides indexed (' + pct + '%) · ' + formatCount(indexDbStats.totalChunks) + ' chunks'
+        : '';
+      metaDiv.textContent = [coverageText, indexMetaText].filter(Boolean).join(' · ');
 
-      if (isIdle && !indexStarted) {
+      // Show the status block whenever there's anything to report — either
+      // a run in flight, or persistent prior progress to display.
+      const hasPriorProgress = cumulativeTotal > 0 && cumulativeIndexed > 0;
+      const shouldShowStatus = isRunning || isComplete || isError || indexStarted || hasPriorProgress;
+
+      if (!shouldShowStatus) {
         startBtn.style.display = 'inline-block';
         startBtn.disabled = false;
         stopBtn.style.display = 'none';
         statusDiv.style.display = 'none';
         return;
       }
+
+      // Per-run stats grid only makes sense during/after an in-flight run.
+      // On a cold load showing only persistent state, keep it hidden.
+      const showRunStats = isRunning || isComplete || isError || indexStarted;
+      statsDiv.style.display = showRunStats ? 'grid' : 'none';
 
       if (isRunning) {
         startBtn.style.display = 'none';
@@ -1742,10 +1779,11 @@ router.get('/panel', (req: Request, res: Response) => {
         stopBtn.textContent = progress.status === 'stopping' ? 'Stopping...' : 'Stop';
         statusDiv.style.display = 'block';
         spinner.style.display = 'block';
-        statsDiv.style.display = 'grid';
-        const totalSuffix = total > 0 ? ' / ' + total : '';
+        const runTotal = progress.totalGuides || 0;
+        const runDone = progress.processedGuides || 0;
+        const totalSuffix = runTotal > 0 ? ' / ' + formatCount(runTotal) : '';
         statusText.textContent = progress.currentGuideTitle
-          ? 'Indexing (' + done + totalSuffix + '): ' + progress.currentGuideTitle.slice(0, 50)
+          ? 'Indexing (' + formatCount(runDone) + totalSuffix + ' this run): ' + progress.currentGuideTitle.slice(0, 50)
           : (progress.message || 'Processing...');
       } else if (isComplete) {
         startBtn.style.display = 'inline-block';
@@ -1753,16 +1791,33 @@ router.get('/panel', (req: Request, res: Response) => {
         stopBtn.style.display = 'none';
         statusDiv.style.display = 'block';
         spinner.style.display = 'none';
-        statsDiv.style.display = 'grid';
         statusText.textContent = progress.message || 'Indexing complete.';
         indexStarted = false;
+        // Run finished — refresh the persistent snapshot so the next render
+        // reflects the just-completed work without depending on per-run state.
+        refreshIndexDbStats().then(data => {
+          if (data && data.progress) {
+            // Re-render with fresh DB stats but the *same* progress so we don't
+            // flip back into a running state.
+            const metaDiv = document.getElementById('indexMeta');
+            const cumulativeIndexed = indexDbStats.indexedGuides;
+            const pct = indexDbStats.totalGuides > 0
+              ? Math.min(100, Math.round((cumulativeIndexed / indexDbStats.totalGuides) * 100))
+              : 0;
+            progressBar.style.width = pct + '%';
+            const coverageText = indexDbStats.totalGuides > 0
+              ? formatCount(cumulativeIndexed) + ' of ' + formatCount(indexDbStats.totalGuides) +
+                ' guides indexed (' + pct + '%) · ' + formatCount(indexDbStats.totalChunks) + ' chunks'
+              : '';
+            metaDiv.textContent = [coverageText, indexMetaText].filter(Boolean).join(' · ');
+          }
+        });
       } else if (isError) {
         startBtn.style.display = 'inline-block';
         startBtn.disabled = false;
         stopBtn.style.display = 'none';
         statusDiv.style.display = 'block';
         spinner.style.display = 'none';
-        statsDiv.style.display = 'grid';
         statusText.textContent = 'Error: ' + (progress.error || progress.message || 'Unknown error');
         indexStarted = false;
       } else if (isIdle && indexStarted) {
@@ -1771,9 +1826,17 @@ router.get('/panel', (req: Request, res: Response) => {
         stopBtn.style.display = 'none';
         statusDiv.style.display = 'block';
         spinner.style.display = 'none';
-        statsDiv.style.display = 'grid';
         statusText.textContent = 'Stopped.';
         indexStarted = false;
+        refreshIndexDbStats();
+      } else if (isIdle && hasPriorProgress) {
+        // Cold load with prior progress — show coverage but keep idle controls.
+        startBtn.style.display = 'inline-block';
+        startBtn.disabled = false;
+        stopBtn.style.display = 'none';
+        statusDiv.style.display = 'block';
+        spinner.style.display = 'none';
+        statusText.textContent = 'Idle. Resume indexing to continue.';
       }
     }
 
@@ -1838,7 +1901,7 @@ router.get('/panel', (req: Request, res: Response) => {
       }
     });
 
-    // Resume on page load if indexing is already running
+    // Resume on page load if indexing is already running and seed cumulative stats.
     function checkIndexStatus() {
       fetch('/api/admin/ai/index/status' + authSuffix)
         .then(r => r.json())
@@ -1847,6 +1910,7 @@ router.get('/panel', (req: Request, res: Response) => {
             indexMetaText = data.embeddingHost + ' / ' + data.embeddingModel +
               (data.vectorSearchAvailable === false ? ' (vector search unavailable — FTS only)' : '');
           }
+          if (data.db) indexDbStats = data.db;
           if (data.progress) {
             updateIndexUI(data.progress);
             if (data.progress.status === 'running' || data.progress.status === 'stopping') {

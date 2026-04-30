@@ -67,6 +67,17 @@ export class IndexingService {
     return { ...this.progress };
   }
 
+  // Persistent counts from the DB — survive process restarts and reflect work
+  // done across all prior runs, not just the current in-memory progress.
+  getDbStats(): { totalGuides: number; indexedGuides: number; totalChunks: number } {
+    const totalGuides = this.db.get<{ c: number }>('SELECT COUNT(*) as c FROM guides')?.c ?? 0;
+    const indexedGuides = this.db.get<{ c: number }>(
+      'SELECT COUNT(*) as c FROM guides WHERE indexed_at IS NOT NULL'
+    )?.c ?? 0;
+    const totalChunks = this.db.get<{ c: number }>('SELECT COUNT(*) as c FROM chunks')?.c ?? 0;
+    return { totalGuides, indexedGuides, totalChunks };
+  }
+
   onProgressChange(cb: IndexProgressCallback): () => void {
     this.listeners.push(cb);
     return () => {
