@@ -2,6 +2,10 @@ import { config } from './config';
 import Database from './database/database';
 import { GuideModel } from './models/Guide';
 import { GameModel } from './models/Game';
+import { EmbeddingService } from './services/EmbeddingService';
+import { SynthesisService } from './services/SynthesisService';
+import { RetrievalService } from './services/RetrievalService';
+import { AnswerService, type AnswerResult } from './services/AnswerService';
 import type { Guide, GuideMetadata, Game } from './types';
 import type { GuideFilters } from './interfaces/IGuideModel';
 
@@ -16,11 +20,42 @@ if (!useRemote) {
 const guideModel = useRemote ? null : new GuideModel();
 const gameModel = useRemote ? null : new GameModel();
 
+// AnswerService stack — only constructed in local mode. In remote mode, the
+// REST server owns these and we proxy through HTTP.
+const answerService = useRemote ? null : (() => {
+  const embeddings = new EmbeddingService({
+    host: config.embeddingHost,
+    model: config.embeddingModel,
+    dim: config.embeddingDim,
+  });
+  const synthesis = new SynthesisService({
+    host: config.synthesisHost,
+    model: config.synthesisModel,
+  });
+  const retrieval = new RetrievalService({ db: Database, embeddingService: embeddings });
+  return new AnswerService({ retrievalService: retrieval, synthesisService: synthesis });
+})();
+
 async function api<T>(path: string): Promise<T> {
   const res = await fetch(`${apiUrl}${path}`);
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     const err = new Error(`API ${res.status} ${path}: ${body.slice(0, 200)}`);
+    (err as any).status = res.status;
+    throw err;
+  }
+  return res.json() as Promise<T>;
+}
+
+async function apiPost<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${apiUrl}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    const err = new Error(`API ${res.status} ${path}: ${text.slice(0, 200)}`);
     (err as any).status = res.status;
     throw err;
   }
@@ -108,6 +143,20 @@ async function dsBrowseGuides(
   };
 }
 
+async function dsAnswerQuestion(
+  question: string,
+  filters: { gameId?: string; platform?: string },
+  topK: number
+): Promise<AnswerResult> {
+  if (useRemote) {
+    const body: Record<string, unknown> = { question, top_k: topK };
+    if (filters.gameId) body.game_id = filters.gameId;
+    if (filters.platform) body.platform = filters.platform;
+    return apiPost<AnswerResult>('/api/guides/answer', body);
+  }
+  return answerService!.answer(question, filters, topK);
+}
+
 async function dsGetStats() {
   if (useRemote) {
     const [guidesPage, gamesPage, guideFilters, gameFilters] = await Promise.all([
@@ -192,7 +241,7 @@ async function main() {
   // --- Tool: search_guides ---
   server.tool(
     'search_guides',
-    'Search for game guides and FAQs by keyword. Searches both titles/tags and full guide content using FTS5. Returns guide summaries (not full content). Use read_guide to get actual content.',
+    'Search game guides and FAQs by keyword (FTS5 over titles, tags, and full content). Returns guide summaries — NOT full guide text. Each result includes an opaque `id` field (e.g. "1CfMYpdTs-Mjti1XBYTLx"); to read a guide, pass that exact `id` value to read_guide as `guide_id`. Do not modify, shorten, or fabricate IDs from titles or filenames — they will 404.',
     {
       query: z.string().describe('Search query (supports FTS5 syntax: AND, OR, NOT, "phrase", prefix*)'),
       limit: z.number().min(1).max(50).default(20).describe('Max results to return'),
@@ -242,7 +291,7 @@ async function main() {
   // --- Tool: search_games ---
   server.tool(
     'search_games',
-    'Search for games by title. Returns matching games with metadata. Use get_game to see full details and associated guides.',
+    'Search games by title (partial match). Returns matching games with metadata. Each result includes an opaque `id` field (e.g. "4eL10FTnMoMaimVOdwL8t"); to fetch full details and the list of guides for that game, pass that exact `id` value to get_game as `game_id`. Do not pass the title or any human-readable name as the ID — only the verbatim `id` returned here. Fabricated IDs will 404.',
     {
       query: z.string().describe('Game title to search for (partial match supported)'),
     },
@@ -276,11 +325,11 @@ async function main() {
   // --- Tool: read_guide ---
   server.tool(
     'read_guide',
-    'Read the content of a specific guide. Guides can be very large, so content is returned in chunks. Use offset to paginate through the content. Start with offset=0.',
+    'Read the content of one specific guide. Guides can be very large; content is returned in chunks (use `offset` to paginate, start with offset=0). Requires the exact `id` of a guide from a prior search_guides, browse_guides, or get_game response. IDs are opaque random strings (e.g. "1CfMYpdTs-Mjti1XBYTLx") — do NOT invent them from titles, filenames, platforms, or any human-readable convention. If you do not already have a real ID, call search_guides first. Do NOT pass the `length` parameter — let it default to 8000. Smaller chunks force many round trips and slow the conversation dramatically.',
     {
-      guide_id: z.string().describe('The guide ID (from search_guides or get_game results)'),
-      offset: z.number().min(0).default(0).describe('Character offset to start reading from'),
-      length: z.number().min(100).max(50000).default(8000).describe('Number of characters to return'),
+      guide_id: z.string().describe('Exact `id` value copied verbatim from a previous search_guides, browse_guides, or get_game tool response. Opaque random string like "1CfMYpdTs-Mjti1XBYTLx". Never fabricate.'),
+      offset: z.number().min(0).default(0).describe('Character offset to start reading from. Use 0 on the first call, then pass the `next_offset` value from the previous response.'),
+      length: z.number().min(4000).max(50000).default(8000).describe('Number of characters to return. Leave unset to use the default of 8000 — do not pass small values, they only multiply the number of round trips needed.'),
     },
     async ({ guide_id, offset, length }) => {
       const guide = await dsGetGuide(guide_id);
@@ -318,9 +367,9 @@ async function main() {
   // --- Tool: get_game ---
   server.tool(
     'get_game',
-    'Get detailed information about a specific game and list all its associated guides.',
+    'Get detailed information about a specific game and the list of guides associated with it. Requires the exact `id` of a game from a prior search_games response. IDs are opaque random strings (e.g. "4eL10FTnMoMaimVOdwL8t") — do NOT pass the title, platform, or any human-readable name. If you do not already have a real ID, call search_games first.',
     {
-      game_id: z.string().describe('The game ID'),
+      game_id: z.string().describe('Exact `id` value copied verbatim from a previous search_games tool response. Opaque random string like "4eL10FTnMoMaimVOdwL8t". Never fabricate from titles or filenames.'),
     },
     async ({ game_id }) => {
       const game = await dsGetGame(game_id);
@@ -363,7 +412,7 @@ async function main() {
   // --- Tool: browse_guides ---
   server.tool(
     'browse_guides',
-    'Browse guides with optional filters by platform or tags. Returns paginated guide summaries without content.',
+    'Browse guides with optional filters by platform or tags. Returns paginated guide summaries (NOT full content). Each result includes an opaque `id` field; pass it verbatim to read_guide as `guide_id` to read the actual guide text. Prefer search_guides for keyword/topic queries; use browse_guides only when the user wants to enumerate by platform or tag.',
     {
       platform: z.string().optional().describe('Filter by platform (e.g., "PlayStation 2", "Game Boy Advance")'),
       tags: z.array(z.string()).optional().describe('Filter by tags (e.g., ["walkthrough", "boss guide"])'),
@@ -395,6 +444,57 @@ async function main() {
           }, null, 2),
         }],
       };
+    }
+  );
+
+  // --- Tool: answer_question ---
+  server.tool(
+    'answer_question',
+    'Answer a natural-language question ("how do I beat the Lich?", "where is the master sword?", "what platforms is FF7 on?") by retrieving relevant chunks from across the GameFAQs archive and synthesizing a cited answer. Returns `{ answer, no_answer, citations, timing_ms }`. Each citation includes a real `guide_id` (opaque, e.g. "1CfMYpdTs-Mjti1XBYTLx") and `chunk_id`; the `guide_id` can be passed verbatim to read_guide for the full source. CRITICAL RULES: (1) If `no_answer` is true OR the answer equals "I don\'t have that information in the available guides.", the archive does not contain the answer — DO NOT fabricate one from your own training data; tell the user the archive lacks coverage and suggest they try search_guides with different keywords. (2) Always preserve the bracketed citation markers ([1], [2], etc.) when relaying the answer — they map to the citations array by 1-based index. (3) Use this tool for question-style queries; use search_guides for keyword exploration and browse_guides for filter-based enumeration. (4) `game_id`, when provided, MUST be an opaque ID from a prior search_games response — do not invent it from a title.',
+    {
+      question: z.string().min(1).max(1000).describe('The natural-language question to answer. Max 1000 characters. Phrase it as a question or instruction ("how do I X", "where is Y") — keyword strings work poorly here; use search_guides for those.'),
+      game_id: z.string().optional().describe('Optional: restrict retrieval to chunks from guides linked to this game. Must be an opaque `id` from a prior search_games response (e.g. "4eL10FTnMoMaimVOdwL8t"). Never fabricate from titles.'),
+      platform: z.string().optional().describe('Optional: restrict retrieval to chunks from guides whose metadata.platform matches this string exactly (e.g. "PlayStation 2", "Game Boy Advance"). Use the values returned by get_archive_stats.guide_platforms.'),
+      top_k: z.number().int().min(1).max(20).default(8).describe('Number of citations to retrieve and ground the answer on. Default 8 is right for most questions; raise only if the question spans many sources.'),
+    },
+    async ({ question, game_id, platform, top_k }) => {
+      try {
+        const result = await dsAnswerQuestion(question, { gameId: game_id, platform }, top_k);
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              answer: result.answer,
+              no_answer: result.no_answer,
+              citations: result.citations.map((c, i) => ({
+                index: i + 1,
+                guide_id: c.guide_id,
+                guide_title: c.guide_title,
+                chunk_id: c.chunk_id,
+                chunk_index: c.chunk_index,
+                excerpt: c.excerpt,
+                score: c.score,
+              })),
+              timing_ms: result.timing_ms,
+            }, null, 2),
+          }],
+        };
+      } catch (err: any) {
+        // Surface 503s from the REST layer (and equivalent local errors) with
+        // the upstream message intact so the caller LLM can react sensibly.
+        const message = err?.message ?? 'Unknown error';
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify({
+              error: 'answer_question failed',
+              detail: message,
+              hint: 'The embedding or synthesis service may be unavailable. Try again, or fall back to search_guides + read_guide.',
+            }),
+          }],
+          isError: true,
+        };
+      }
     }
   );
 
