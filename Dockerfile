@@ -1,10 +1,13 @@
 # GameFAQs Server Dockerfile
-# Uses Alpine Linux for smaller image size
+# Debian-slim base: sqlite-vec ships glibc-linked prebuilt binaries that won't
+# load on Alpine's musl. node:20-bookworm-slim is ~25 MB larger and works.
 
-FROM node:20-alpine
+FROM node:20-bookworm-slim
 
-# Install p7zip for 7z extraction
-RUN apk add --no-cache p7zip
+# p7zip-full for 7z extraction; wget for the HEALTHCHECK below.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends p7zip-full wget \
+  && rm -rf /var/lib/apt/lists/*
 
 # Create app directory
 WORKDIR /app
