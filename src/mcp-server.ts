@@ -145,13 +145,16 @@ async function dsBrowseGuides(
 
 async function dsAnswerQuestion(
   question: string,
-  filters: { gameId?: string; platform?: string },
+  filters: { gameId?: string; platform?: string; genre?: string; tags?: string[]; tagMatch?: 'any' | 'all' },
   topK: number
 ): Promise<AnswerResult> {
   if (useRemote) {
     const body: Record<string, unknown> = { question, top_k: topK };
     if (filters.gameId) body.game_id = filters.gameId;
     if (filters.platform) body.platform = filters.platform;
+    if (filters.genre) body.genre = filters.genre;
+    if (filters.tags && filters.tags.length > 0) body.tags = filters.tags;
+    if (filters.tagMatch) body.tag_match = filters.tagMatch;
     return apiPost<AnswerResult>('/api/guides/answer', body);
   }
   return answerService!.answer(question, filters, topK);
@@ -455,11 +458,14 @@ async function main() {
       question: z.string().min(1).max(1000).describe('The natural-language question to answer. Max 1000 characters. Phrase it as a question or instruction ("how do I X", "where is Y") — keyword strings work poorly here; use search_guides for those.'),
       game_id: z.string().optional().describe('Optional: restrict retrieval to chunks from guides linked to this game. Must be an opaque `id` from a prior search_games response (e.g. "4eL10FTnMoMaimVOdwL8t"). Never fabricate from titles.'),
       platform: z.string().optional().describe('Optional: restrict retrieval to chunks from guides whose metadata.platform matches this string exactly (e.g. "PlayStation 2", "Game Boy Advance"). Use the values returned by get_archive_stats.guide_platforms.'),
+      genre: z.string().optional().describe('Optional: restrict retrieval to guides whose metadata.genre matches this string exactly (e.g. "JRPG", "FPS"). Sourced from AI analysis; not all guides have it set.'),
+      tags: z.array(z.string()).optional().describe('Optional: restrict retrieval to guides tagged with these values. Use values returned by get_archive_stats.tags.'),
+      tag_match: z.enum(['any', 'all']).optional().describe("How to combine multiple `tags` (default 'any'). 'all' requires every tag to be present on the guide."),
       top_k: z.number().int().min(1).max(20).default(8).describe('Number of citations to retrieve and ground the answer on. Default 8 is right for most questions; raise only if the question spans many sources.'),
     },
-    async ({ question, game_id, platform, top_k }) => {
+    async ({ question, game_id, platform, genre, tags, tag_match, top_k }) => {
       try {
-        const result = await dsAnswerQuestion(question, { gameId: game_id, platform }, top_k);
+        const result = await dsAnswerQuestion(question, { gameId: game_id, platform, genre, tags, tagMatch: tag_match }, top_k);
         return {
           content: [{
             type: 'text' as const,

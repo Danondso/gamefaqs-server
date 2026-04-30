@@ -26,6 +26,9 @@ export interface Citation {
 export interface RetrievalFilters {
   gameId?: string;
   platform?: string;
+  genre?: string;
+  tags?: string[];
+  tagMatch?: 'any' | 'all';
 }
 
 export interface VectorHit {
@@ -96,7 +99,7 @@ export class RetrievalService {
     filters: RetrievalFilters,
     topK: number
   ): Promise<{ citations: Citation[]; embedMs: number; retrieveMs: number }> {
-    const hasFilters = !!(filters.gameId || filters.platform);
+    const hasFilters = !!(filters.gameId || filters.platform || filters.genre || (filters.tags && filters.tags.length > 0));
     const vecK = hasFilters ? this.vecLimit * FILTER_OVERFETCH : this.vecLimit;
 
     const tEmbedStart = now();
@@ -196,6 +199,22 @@ export class RetrievalService {
     if (filters.platform) {
       where += " AND json_extract(g.metadata, '$.platform') = ?";
       params.push(filters.platform);
+    }
+    if (filters.genre) {
+      where += " AND json_extract(g.metadata, '$.genre') = ?";
+      params.push(filters.genre);
+    }
+    if (filters.tags && filters.tags.length > 0) {
+      if (filters.tagMatch === 'all') {
+        for (const tag of filters.tags) {
+          where += ' AND EXISTS (SELECT 1 FROM guide_tags gt WHERE gt.guide_id = g.id AND gt.tag = ?)';
+          params.push(tag);
+        }
+      } else {
+        const tagPlaceholders = filters.tags.map(() => '?').join(',');
+        where += ` AND EXISTS (SELECT 1 FROM guide_tags gt WHERE gt.guide_id = g.id AND gt.tag IN (${tagPlaceholders}))`;
+        params.push(...filters.tags);
+      }
     }
     const rows = this.db.query<{ id: string }>(
       `SELECT c.id FROM chunks c JOIN guides g ON g.id = c.guide_id WHERE ${where}`,

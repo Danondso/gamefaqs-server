@@ -42,7 +42,7 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
   // the :id handler.
   router.post('/answer', answerRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { question, game_id, platform, top_k } = req.body ?? {};
+      const { question, game_id, platform, genre, tags, tag_match, top_k } = req.body ?? {};
 
       if (typeof question !== 'string' || question.trim().length === 0) {
         res.status(400).json({ error: 'question is required' });
@@ -58,6 +58,18 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
       }
       if (platform !== undefined && typeof platform !== 'string') {
         res.status(400).json({ error: 'platform must be a string' });
+        return;
+      }
+      if (genre !== undefined && typeof genre !== 'string') {
+        res.status(400).json({ error: 'genre must be a string' });
+        return;
+      }
+      if (tags !== undefined && (!Array.isArray(tags) || !tags.every(t => typeof t === 'string'))) {
+        res.status(400).json({ error: 'tags must be an array of strings' });
+        return;
+      }
+      if (tag_match !== undefined && tag_match !== 'any' && tag_match !== 'all') {
+        res.status(400).json({ error: "tag_match must be 'any' or 'all'" });
         return;
       }
       let topK = config.ragTopK;
@@ -77,7 +89,7 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
       try {
         const result = await answerService.answer(
           question.trim(),
-          { gameId: game_id, platform },
+          { gameId: game_id, platform, genre, tags, tagMatch: tag_match },
           topK
         );
         res.json(result);
