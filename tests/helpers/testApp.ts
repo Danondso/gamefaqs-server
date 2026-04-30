@@ -10,12 +10,14 @@ import type { IGuideModel } from '../../src/interfaces/IGuideModel';
 import type { IGameModel } from '../../src/interfaces/IGameModel';
 import type { IInitService } from '../../src/interfaces/IInitService';
 import type { InitStatus } from '../../src/types';
+import type { AnswerService } from '../../src/services/AnswerService';
 
 export interface TestAppDependencies {
   db: IDatabase;
   guideModel: IGuideModel;
   gameModel: IGameModel;
   initService: IInitService;
+  answerService?: AnswerService;
 }
 
 export interface TestAppResult {
@@ -62,14 +64,18 @@ export function createTestApp(overrides?: Partial<TestAppDependencies>): TestApp
     guideModel,
     gameModel,
     initService,
+    answerService: overrides?.answerService,
   };
 
   // Create Express app
   const app = express();
+  // app.set('trust proxy', true) so req.ip respects supertest's X-Forwarded-For,
+  // letting individual /answer tests vary the IP for rate-limit checks.
+  app.set('trust proxy', true);
   app.use(express.json());
 
   // Use the REAL route factories with injected dependencies
-  app.use('/api/guides', createGuidesRouter({ guideModel }));
+  app.use('/api/guides', createGuidesRouter({ guideModel, answerService: deps.answerService }));
   app.use('/api/games', createGamesRouter({ gameModel, guideModel }));
   app.use('/api/health', createHealthRouter({ guideModel, gameModel, initService }));
 

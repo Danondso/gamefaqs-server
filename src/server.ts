@@ -3,6 +3,11 @@ import swaggerUi from 'swagger-ui-express';
 import { config } from './config';
 import Database from './database/database';
 import InitService from './services/InitService';
+import { EmbeddingService } from './services/EmbeddingService';
+import { SynthesisService } from './services/SynthesisService';
+import { RetrievalService } from './services/RetrievalService';
+import { AnswerService } from './services/AnswerService';
+import GuideModel from './models/Guide';
 import { openApiSpec } from './openapi';
 
 // Middleware
@@ -12,7 +17,7 @@ import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { createRateLimiter } from './middleware/rateLimit';
 
 // Routes
-import guidesRouter from './routes/guides';
+import { createGuidesRouter } from './routes/guides';
 import gamesRouter from './routes/games';
 import healthRouter from './routes/health';
 import adminRouter from './routes/admin';
@@ -28,6 +33,24 @@ async function main() {
   // Initialize database
   console.log('[Server] Initializing database...');
   Database.initialize(config.dbPath);
+
+  // RAG services. The /api/guides/answer endpoint depends on these; if Ollama
+  // hosts are unreachable at request time the route returns 503 — these
+  // constructors only validate config, not connectivity.
+  const embeddingService = new EmbeddingService({
+    host: config.embeddingHost,
+    model: config.embeddingModel,
+    dim: config.embeddingDim,
+  });
+  const synthesisService = new SynthesisService({
+    host: config.synthesisHost,
+    model: config.synthesisModel,
+  });
+  const retrievalService = new RetrievalService({
+    db: Database,
+    embeddingService,
+  });
+  const answerService = new AnswerService({ retrievalService, synthesisService });
 
   // Create Express app
   const app = express();
@@ -92,7 +115,7 @@ async function main() {
   );
 
   // API Routes
-  app.use('/api/guides', guidesRouter);
+  app.use('/api/guides', createGuidesRouter({ guideModel: GuideModel, answerService }));
   app.use('/api/guides/:guideId/bookmarks', bookmarksRouter);
   app.use('/api/guides/:guideId/notes', notesRouter);
   app.use('/api/games', gamesRouter);
