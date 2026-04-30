@@ -15,9 +15,13 @@ COPY src ./src
 RUN npm run mcp:bundle
 
 # --- Stage 2: install only the native dep (better-sqlite3) -----------------
+# Pin sourced from the workspace package.json so a version bump there flows
+# through automatically — no second hand-edited literal to drift.
 FROM node:20-bookworm-slim AS deps
 WORKDIR /app
-RUN printf '%s' '{"private":true,"dependencies":{"better-sqlite3":"^12.6.2"}}' > package.json \
+COPY package.json ./package.json.full
+RUN node -e "const p=require('./package.json.full');require('fs').writeFileSync('./package.json',JSON.stringify({private:true,dependencies:{'better-sqlite3':p.dependencies['better-sqlite3']}}))" \
+ && rm package.json.full \
  && npm install --omit=dev --no-audit --no-fund --no-package-lock \
  && rm -rf /root/.npm package.json \
  # Strip source-build artifacts; we only need the prebuilt .node binary + JS wrapper

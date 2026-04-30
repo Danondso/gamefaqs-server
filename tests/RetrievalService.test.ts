@@ -26,6 +26,8 @@ interface SeededGuide {
   title: string;
   game_id?: string | null;
   platform?: string;
+  genre?: string;
+  tags?: string[];
 }
 
 function seed(db: IDatabase, guides: SeededGuide[], chunks: SeededChunk[]): void {
@@ -40,7 +42,11 @@ function seed(db: IDatabase, guides: SeededGuide[], chunks: SeededChunk[]): void
     );
   }
   for (const g of guides) {
-    const metadata = g.platform ? JSON.stringify({ platform: g.platform }) : null;
+    const metaObj: Record<string, unknown> = {};
+    if (g.platform) metaObj.platform = g.platform;
+    if (g.genre) metaObj.genre = g.genre;
+    if (g.tags) metaObj.tags = g.tags;
+    const metadata = Object.keys(metaObj).length > 0 ? JSON.stringify(metaObj) : null;
     db.run(
       `INSERT INTO guides (id, title, content, format, file_path, game_id, metadata, created_at, updated_at)
        VALUES (?, ?, ?, 'txt', ?, ?, ?, ?, ?)`,
@@ -186,6 +192,90 @@ describe('RetrievalService', () => {
     const citations = await svc.retrieve('q', { platform: 'Xbox' }, 5);
     expect(citations).toHaveLength(1);
     expect(citations[0].chunk_id).toBe('cXB');
+  });
+
+  it('drops chunks whose guide does not match genre filter', async () => {
+    const guides: SeededGuide[] = [
+      { id: 'gRPG', title: 'RPG Guide', genre: 'JRPG' },
+      { id: 'gFPS', title: 'FPS Guide', genre: 'FPS' },
+    ];
+    const chunks: SeededChunk[] = [
+      { id: 'cRPG', guide_id: 'gRPG', index: 0, content: 'rpg content' },
+      { id: 'cFPS', guide_id: 'gFPS', index: 0, content: 'fps content' },
+    ];
+    seed(db, guides, chunks);
+
+    const svc = new RetrievalService({
+      db,
+      embeddingService: mockEmbedder,
+      vectorSearch: () => [
+        { chunk_id: 'cRPG', distance: 0.1 },
+        { chunk_id: 'cFPS', distance: 0.2 },
+      ],
+      ftsSearch: () => [],
+    });
+
+    const citations = await svc.retrieve('q', { genre: 'JRPG' }, 5);
+    expect(citations).toHaveLength(1);
+    expect(citations[0].chunk_id).toBe('cRPG');
+  });
+
+  it("tagMatch='any' returns chunks whose guide has at least one of the requested tags", async () => {
+    const guides: SeededGuide[] = [
+      { id: 'g1', title: 'G1', tags: ['rpg', 'guide'] },
+      { id: 'g2', title: 'G2', tags: ['fps'] },
+      { id: 'g3', title: 'G3', tags: ['walkthrough'] },
+    ];
+    const chunks: SeededChunk[] = [
+      { id: 'c1', guide_id: 'g1', index: 0, content: 'one' },
+      { id: 'c2', guide_id: 'g2', index: 0, content: 'two' },
+      { id: 'c3', guide_id: 'g3', index: 0, content: 'three' },
+    ];
+    seed(db, guides, chunks);
+
+    const svc = new RetrievalService({
+      db,
+      embeddingService: mockEmbedder,
+      vectorSearch: () => [
+        { chunk_id: 'c1', distance: 0.1 },
+        { chunk_id: 'c2', distance: 0.2 },
+        { chunk_id: 'c3', distance: 0.3 },
+      ],
+      ftsSearch: () => [],
+    });
+
+    const citations = await svc.retrieve('q', { tags: ['rpg', 'fps'], tagMatch: 'any' }, 5);
+    const ids = new Set(citations.map(c => c.chunk_id));
+    expect(ids).toEqual(new Set(['c1', 'c2']));
+  });
+
+  it("tagMatch='all' returns only chunks whose guide has every requested tag", async () => {
+    const guides: SeededGuide[] = [
+      { id: 'gBoth', title: 'Both', tags: ['rpg', 'guide'] },
+      { id: 'gRpgOnly', title: 'Rpg only', tags: ['rpg'] },
+      { id: 'gGuideOnly', title: 'Guide only', tags: ['guide'] },
+    ];
+    const chunks: SeededChunk[] = [
+      { id: 'cBoth', guide_id: 'gBoth', index: 0, content: 'both' },
+      { id: 'cRpgOnly', guide_id: 'gRpgOnly', index: 0, content: 'rpg' },
+      { id: 'cGuideOnly', guide_id: 'gGuideOnly', index: 0, content: 'guide' },
+    ];
+    seed(db, guides, chunks);
+
+    const svc = new RetrievalService({
+      db,
+      embeddingService: mockEmbedder,
+      vectorSearch: () => [
+        { chunk_id: 'cBoth', distance: 0.1 },
+        { chunk_id: 'cRpgOnly', distance: 0.2 },
+        { chunk_id: 'cGuideOnly', distance: 0.3 },
+      ],
+      ftsSearch: () => [],
+    });
+
+    const citations = await svc.retrieve('q', { tags: ['rpg', 'guide'], tagMatch: 'all' }, 5);
+    expect(citations).toHaveLength(1);
+    expect(citations[0].chunk_id).toBe('cBoth');
   });
 
   it('returns empty array when both retrievers return nothing', async () => {
