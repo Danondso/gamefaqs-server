@@ -685,6 +685,10 @@ router.get('/panel', (req: Request, res: Response) => {
       padding: 24px;
       border: 1px solid #334155;
     }
+    /* Tighter bottom padding on the top stat cards (Total Guides, Total Games,
+       Database Size, Server Uptime) — they only contain a label/value/label
+       triplet and don't need the full 24px below. */
+    .grid > .card { padding-bottom: 12px; }
     .card-title {
       font-size: 0.875rem;
       text-transform: uppercase;
@@ -702,7 +706,13 @@ router.get('/panel', (req: Request, res: Response) => {
       color: #64748b;
       margin-top: 4px;
     }
-    .progress-section { margin-top: 30px; }
+    /* Uniform 20px gap between consecutive top-level panels — matches the
+       grid's gap. The grid's own margin-bottom handles the gap between the
+       stat cards and the first standalone card; this rule handles every
+       card-to-card transition after that. Scoped to .container's direct
+       children so grid items aren't pushed by sibling-margin selectors. */
+    .container > .card + .card { margin-top: 20px; }
+    .progress-section { margin-top: 0; }
     .progress-bar {
       width: 100%;
       height: 32px;
@@ -1114,9 +1124,14 @@ router.get('/panel', (req: Request, res: Response) => {
       document.getElementById('gameCount').textContent = initStatus.gameCount.toLocaleString();
     }
 
+    function formatSizeMB(mb) {
+      if (mb >= 1024) return (mb / 1024).toFixed(2) + ' GB';
+      return mb.toFixed(2) + ' MB';
+    }
+
     function updateFullStatus(data) {
       updateUI(data.init);
-      document.getElementById('dbSize').textContent = data.database.sizeMB + ' MB';
+      document.getElementById('dbSize').textContent = formatSizeMB(data.database.sizeMB);
 
       const uptimeHours = Math.floor(data.server.uptime / 3600);
       const uptimeMinutes = Math.floor((data.server.uptime % 3600) / 60);
