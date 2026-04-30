@@ -33,8 +33,13 @@ export const config = {
   embeddingDim: parseInt(process.env.EMBEDDING_DIM || '768', 10),
   synthesisHost: process.env.SYNTHESIS_OLLAMA_HOST || process.env.OLLAMA_HOST || 'http://localhost:11434',
   synthesisModel: process.env.SYNTHESIS_MODEL || 'qwen2.5:7b-instruct',
-  chunkSizeTokens: parseInt(process.env.CHUNK_SIZE_TOKENS || '800', 10),
-  chunkOverlapTokens: parseInt(process.env.CHUNK_OVERLAP_TOKENS || '100', 10),
+  // Default 400 tokens is intentionally conservative: nomic-embed-text's hard
+  // context limit is 2048 tokens, and our chars/4 estimate undercounts BPE for
+  // content with lots of CRLF, abbreviations, or stat tables (real density can
+  // be 2-3x the estimate). 400 leaves enough headroom that even pathological
+  // content stays under 2048 after chunking + overlap.
+  chunkSizeTokens: parseInt(process.env.CHUNK_SIZE_TOKENS || '400', 10),
+  chunkOverlapTokens: parseInt(process.env.CHUNK_OVERLAP_TOKENS || '50', 10),
   vectorSearchEnabled: process.env.VECTOR_SEARCH_ENABLED !== 'false',
   ragTopK: parseInt(process.env.RAG_TOP_K || '8', 10),
   answerRateLimitPerMin: parseInt(process.env.ANSWER_RATE_LIMIT || '10', 10),

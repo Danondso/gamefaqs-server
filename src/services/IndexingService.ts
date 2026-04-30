@@ -188,10 +188,18 @@ export class IndexingService {
             this.progress.succeededGuides++;
           }
         } catch (err: any) {
-          // Embedding or DB write failed for this guide. Record + continue;
-          // do NOT set indexed_at so a future run can retry.
+          // Embedding or DB write failed for this guide. Record + continue.
+          // Mark indexed_at so the loop advances past this guide — otherwise
+          // SELECT WHERE indexed_at IS NULL LIMIT 1 returns the same broken
+          // guide every iteration and the indexer infinite-loops. To retry
+          // failures, run with ?force=true.
           this.progress.failedGuides++;
-          console.error(`[Indexing] guide ${guide.id} failed:`, err.message);
+          console.error(`[Indexing] guide ${guide.id} failed (marked, will not retry without force):`, err.message);
+          try {
+            updateIndexedAtStmt.run(Date.now(), guide.id);
+          } catch (markErr: any) {
+            console.error(`[Indexing] could not mark ${guide.id} as tried:`, markErr.message);
+          }
         }
 
         this.progress.processedGuides++;
