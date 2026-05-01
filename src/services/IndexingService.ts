@@ -209,7 +209,12 @@ export class IndexingService {
           try {
             updateIndexedAtStmt.run(Date.now(), guide.id);
           } catch (markErr: any) {
-            console.error(`[Indexing] could not mark ${guide.id} as tried:`, markErr.message);
+            // If we can't even mark this guide as tried, the next SELECT will
+            // return it again — processedGuides would inflate without progress.
+            // Bail rather than spin.
+            throw new Error(
+              `Indexer stuck on guide ${guide.id}: could not mark as tried (${markErr.message}); aborting to avoid infinite loop`
+            );
           }
         }
 
