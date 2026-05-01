@@ -117,17 +117,19 @@ export class RetrievalService {
       console.warn('[Retrieval] vector search failed, continuing with FTS only:', err.message);
     }
 
+    // FTS5 chokes on raw user input: `?`, `!`, parentheses, and bare AND/OR/NOT
+    // are all reserved syntax. The previous fallback wrapped the entire question
+    // in quotes, which turns it into a phrase search ("the literal sentence
+    // appears verbatim") — that never matches a chunk and silently zeros out
+    // the FTS contribution to RRF. Strip operator chars and quote each token
+    // individually so the tokens AND together as plain terms.
+    const ftsQuery = sanitizeFtsQuery(question);
     try {
-      ftsHits = this.ftsSearch(question, this.ftsLimit);
+      ftsHits = ftsQuery ? this.ftsSearch(ftsQuery, this.ftsLimit) : [];
     } catch (err: any) {
-      // FTS5 syntax error — retry with the question wrapped in quotes (same trick
-      // as the MCP search_guides handler).
-      if (err.message?.includes('fts5') || err.message?.includes('syntax error')) {
-        const safe = `"${question.replace(/"/g, '')}"`;
-        ftsHits = this.ftsSearch(safe, this.ftsLimit);
-      } else {
-        throw err;
-      }
+      // Should not happen after sanitization, but if it does we fall back to
+      // vector-only retrieval rather than failing the whole request.
+      console.warn('[Retrieval] FTS search failed after sanitization:', err.message);
     }
 
     // Apply filters before fusion so RRF rank reflects post-filter ordering.
@@ -244,3 +246,50 @@ export class RetrievalService {
 // Exported helper so callers (admin/answer route, AnswerService) can record the
 // embed step's wall time without re-implementing performance.now() bookkeeping.
 export const now = (): number => performance.now();
+
+// FTS5 reserves a number of characters and bare keywords. Sanitize a raw user
+// question so it can be passed to MATCH without syntax errors and without
+// accidentally enabling phrase / boolean operators.
+//
+// Strategy: tokenize, drop punctuation + boolean keywords + common stopwords,
+// quote each surviving token (so anything that resembles a keyword is treated
+// as a literal term), and OR the tokens together. OR (rather than the implicit
+// AND of bare terms) is correct for question-answering: a 14-word question
+// rarely has a chunk containing every word, but BM25 ranking of an OR query
+// naturally surfaces chunks rich in the rare/specific terms ("Sephiroth")
+// while ignoring the common ones ("the", "in").
+//
+// Exported for tests.
+const STOPWORDS = new Set([
+  'a','an','the','is','are','was','were','be','been','being','am','i','you','he','she','it','we','they','me','him','her','us','them','my','your','his','its','our','their',
+  'and','or','but','if','then','else','when','while','as','of','at','by','for','with','about','against','between','into','through','during','before','after','above','below','to','from','up','down','in','out','on','off','over','under','again','further',
+  'do','does','did','doing','have','has','had','having','can','could','should','would','will','shall','may','might','must',
+  'this','that','these','those','what','which','who','whom','whose','why','how',
+  'not','no','nor','so','than','too','very','just','also','only','own','same','such','any','some','all','each','every','few','more','most','other','another',
+]);
+
+export function sanitizeFtsQuery(question: string): string {
+  // Replace anything that isn't a letter, digit, or whitespace with a space.
+  // This catches ?, !, (), ", -, +, ^, *, etc.
+  const cleaned = question.replace(/[^\p{L}\p{N}\s]/gu, ' ');
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+  for (const raw of cleaned.split(/\s+/)) {
+    if (!raw) continue;
+    const upper = raw.toUpperCase();
+    // Drop FTS5 boolean keywords explicitly (also covered by stopwords for
+    // the lowercase forms, but the spec is case-sensitive so we belt-and-
+    // braces).
+    if (upper === 'AND' || upper === 'OR' || upper === 'NOT' || upper === 'NEAR') continue;
+    const lower = raw.toLowerCase();
+    if (STOPWORDS.has(lower)) continue;
+    // Dedup repeated tokens — they don't add ranking signal in BM25.
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    tokens.push(raw);
+  }
+  if (tokens.length === 0) return '';
+  // Quote each token so reserved-keyword-shaped terms are treated as literals;
+  // OR them so BM25 can rank chunks by how many specific terms hit.
+  return tokens.map(t => `"${t}"`).join(' OR ');
+}

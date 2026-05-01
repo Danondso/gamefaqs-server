@@ -38,10 +38,20 @@ function estimateTokens(text: string): number {
 }
 
 function isMostlyAsciiArt(text: string): boolean {
-  if (text.length === 0) return true;
-  const alnum = text.match(/[a-zA-Z0-9]/g)?.length ?? 0;
-  const nonAlnum = text.length - alnum;
-  return nonAlnum / text.length > ASCII_ART_THRESHOLD;
+  const len = text.length;
+  if (len === 0) return true;
+  let alnum = 0;
+  for (let i = 0; i < len; i++) {
+    const c = text.charCodeAt(i);
+    if (
+      (c >= 48 && c <= 57) ||  // 0-9
+      (c >= 65 && c <= 90) ||  // A-Z
+      (c >= 97 && c <= 122)    // a-z
+    ) {
+      alnum++;
+    }
+  }
+  return (len - alnum) / len > ASCII_ART_THRESHOLD;
 }
 
 function splitParagraphs(content: string): Segment[] {

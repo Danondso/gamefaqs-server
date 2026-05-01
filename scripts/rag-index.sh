@@ -5,11 +5,11 @@
 # Defaults to localhost:3000 with the placeholder admin token. For the
 # Mac mini deployment (or any remote host) override either or both:
 #
-#   GAMEFAQS_HOST=http://192.168.50.240:3000 ADMIN_TOKEN=hunter2 ./scripts/rag-index.sh status
+#   GAMEFAQS_HOST=http://your-host.local:3000 ADMIN_TOKEN=hunter2 ./scripts/rag-index.sh status
 #
 # Or export them once per shell:
 #
-#   export GAMEFAQS_HOST=http://192.168.50.240:3000
+#   export GAMEFAQS_HOST=http://your-host.local:3000
 #   export ADMIN_TOKEN=hunter2
 #   ./scripts/rag-index.sh start
 #

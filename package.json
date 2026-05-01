@@ -9,6 +9,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "rag:bench": "RAG_BENCH=1 vitest run tests/benchmarks/rag-accuracy.test.ts --reporter=verbose --testTimeout=200000",
     "docker:build": "docker build -t gamefaqs-server .",
     "docker:run": "docker-compose up",
     "mcp": "ts-node src/mcp-server.ts",

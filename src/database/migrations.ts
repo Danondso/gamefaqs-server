@@ -188,8 +188,26 @@ const migration_v5: Migration = {
   },
 };
 
+// Migration v6: Composite index (indexed_at, id) for the indexer's prefetch
+// cursor. The previous single-column idx_guides_indexed_at served IS NULL
+// filters but couldn't satisfy ORDER BY id, so the indexer was building a
+// TEMP B-TREE over every unindexed row per SELECT.
+const migration_v6: Migration = {
+  version: 6,
+  up: (db: Database.Database) => {
+    console.log('[Migrations] Adding composite index idx_guides_indexed_at_id (may take a few seconds on large DBs)...');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_guides_indexed_at_id ON guides(indexed_at, id)');
+    db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (6, ${Date.now()})`);
+    console.log('[Migrations] v6 applied');
+  },
+  down: (db: Database.Database) => {
+    db.exec('DROP INDEX IF EXISTS idx_guides_indexed_at_id');
+    db.exec('DELETE FROM schema_version WHERE version = 6');
+  },
+};
+
 // All migrations in order
-export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5];
+export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5, migration_v6];
 
 // Get current schema version from database
 export function getCurrentVersion(db: Database.Database): number {

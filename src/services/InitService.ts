@@ -51,30 +51,37 @@ class InitService {
 
       this.status.startTime = Date.now();
 
-      // Ensure temp directory exists
+      // Ensure temp + archive directories exist. archiveDir is intentionally
+      // decoupled from tempDir so the operator can mount it from a persistent
+      // host path; that lets the archive survive volume wipes (e.g.
+      // `docker compose down -v`) and avoids re-downloading ~12 GB.
       if (!fs.existsSync(config.tempDir)) {
         fs.mkdirSync(config.tempDir, { recursive: true });
+      }
+      if (!fs.existsSync(config.archiveDir)) {
+        fs.mkdirSync(config.archiveDir, { recursive: true });
       }
 
       // Stage 1: Download archive (30% of progress)
       this.updateStatus('downloading', 0, 'Downloading archive from Internet Archive...');
-      const archivePath = path.join(config.tempDir, 'gamefaqs_archive.zip');
+      const archivePath = path.join(config.archiveDir, 'gamefaqs_archive.zip');
 
-      // Reuse a previously-kept archive if it's already on disk and matches
-      // the remote Content-Length. Saves a ~12 GB re-download for users who
-      // ran with KEEP_ARCHIVE=true on a prior setup.
+      // Reuse any archive already on disk. Saves a ~12 GB re-download for
+      // users who ran with KEEP_ARCHIVE=true on a prior setup, and supports
+      // the "browser-download the file faster, then drop it in" workflow.
+      // We never auto-delete a file the operator put here — if it's actually
+      // corrupt or truncated, extraction will fail loudly downstream.
       let skipDownload = false;
       if (fs.existsSync(archivePath)) {
         const localSize = fs.statSync(archivePath).size;
         const remoteSize = await ArchiveDownloadService.getRemoteSize(config.archiveUrl);
-        if (remoteSize !== null && localSize === remoteSize) {
-          console.log(`[Init] Found existing archive at ${archivePath} (${(localSize / 1024 / 1024).toFixed(1)} MB) — skipping download`);
-          this.updateStatus('downloading', 30, 'Reusing existing archive');
-          skipDownload = true;
+        if (remoteSize !== null && localSize !== remoteSize) {
+          console.warn(`[Init] Existing archive size mismatch (local ${localSize}, remote ${remoteSize}) — using it anyway; extraction will fail if it's truncated`);
         } else {
-          console.log(`[Init] Existing archive size mismatch (local ${localSize}, remote ${remoteSize ?? 'unknown'}) — re-downloading`);
-          try { fs.unlinkSync(archivePath); } catch { /* fall through */ }
+          console.log(`[Init] Found existing archive at ${archivePath} (${(localSize / 1024 / 1024).toFixed(1)} MB) — skipping download`);
         }
+        this.updateStatus('downloading', 30, 'Reusing existing archive');
+        skipDownload = true;
       }
 
       if (!skipDownload) {

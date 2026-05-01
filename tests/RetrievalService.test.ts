@@ -3,6 +3,7 @@ import { createTestDatabase } from './helpers/testDb';
 import type { IDatabase } from '../src/interfaces/IDatabase';
 import {
   RetrievalService,
+  sanitizeFtsQuery,
   type FtsHit,
   type VectorHit,
 } from '../src/services/RetrievalService';
@@ -105,7 +106,9 @@ describe('RetrievalService', () => {
       rrfK: 60,
     });
 
-    const citations = await svc.retrieve('any', {}, 4);
+    // Use a non-stopword query so the sanitized FTS query is non-empty and
+    // the mocked ftsSearch is actually invoked.
+    const citations = await svc.retrieve('sephiroth', {}, 4);
     const ids = citations.map(c => c.chunk_id);
     // c-B1 appears in both lists (vec rank 2, fts rank 1) → should outrank
     // single-list hits like c-A2 (vec rank 1) and c-A1 (vec rank 3 + fts rank 2).
@@ -289,19 +292,13 @@ describe('RetrievalService', () => {
     expect(citations).toEqual([]);
   });
 
-  it('survives FTS5 syntax errors by retrying with the question quoted', async () => {
+  it('sanitizes FTS5 reserved characters in user questions', async () => {
     const g: SeededGuide = { id: 'g', title: 'G' };
     seed(db, [g], [{ id: 'c1', guide_id: 'g', index: 0, content: 'hello world' }]);
 
-    let calls = 0;
+    let receivedQuery = '';
     const ftsSearch = (q: string): FtsHit[] => {
-      calls++;
-      if (calls === 1) {
-        const err = new Error('fts5: syntax error near "AND"');
-        throw err;
-      }
-      // Second call should be the quoted version
-      expect(q.startsWith('"') && q.endsWith('"')).toBe(true);
+      receivedQuery = q;
       return [{ chunk_id: 'c1', rank: -1 }];
     };
 
@@ -312,9 +309,69 @@ describe('RetrievalService', () => {
       ftsSearch,
     });
 
+    const citations = await svc.retrieve('How do I beat Sephiroth?', {}, 5);
+    expect(citations).toHaveLength(1);
+    // No raw `?` should reach FTS5 (would syntax-error). All tokens are quoted
+    // so reserved keywords are treated as literal terms. Stopwords ("How", "do",
+    // "I") are dropped so BM25 ranks on meaningful terms.
+    expect(receivedQuery).not.toContain('?');
+    expect(receivedQuery).toContain('"Sephiroth"');
+    expect(receivedQuery).not.toContain('"How"');
+  });
+
+  it('skips FTS entirely when the sanitized query is empty (only operator keywords / punctuation)', async () => {
+    const g: SeededGuide = { id: 'g', title: 'G' };
+    seed(db, [g], [{ id: 'c1', guide_id: 'g', index: 0, content: 'hello world' }]);
+
+    let ftsCalls = 0;
+    const ftsSearch = (): FtsHit[] => { ftsCalls++; return []; };
+
+    const svc = new RetrievalService({
+      db,
+      embeddingService: mockEmbedder,
+      vectorSearch: () => [{ chunk_id: 'c1', distance: 0.5 }],
+      ftsSearch,
+    });
+
     const citations = await svc.retrieve('AND OR NOT', {}, 5);
+    // Vector hit still serves the query.
     expect(citations).toHaveLength(1);
     expect(citations[0].chunk_id).toBe('c1');
-    expect(calls).toBe(2);
+    // FTS was skipped — sanitization stripped the bare boolean keywords.
+    expect(ftsCalls).toBe(0);
+  });
+});
+
+describe('sanitizeFtsQuery', () => {
+  it('strips question marks and other FTS5 reserved punctuation', () => {
+    expect(sanitizeFtsQuery('beat Sephiroth?')).toBe('"beat" OR "Sephiroth"');
+    expect(sanitizeFtsQuery('parens (here) work')).toBe('"parens" OR "here" OR "work"');
+    expect(sanitizeFtsQuery('hyphen-word')).toBe('"hyphen" OR "word"');
+  });
+
+  it('drops bare boolean keywords AND/OR/NOT/NEAR', () => {
+    expect(sanitizeFtsQuery('foo AND bar')).toBe('"foo" OR "bar"');
+    expect(sanitizeFtsQuery('AND OR NOT')).toBe('');
+  });
+
+  it('drops common English stopwords so BM25 ranks on meaningful tokens', () => {
+    // "How", "do", "I", "in", "the" all dropped; only Sephiroth survives.
+    expect(sanitizeFtsQuery('How do I beat Sephiroth in the boss fight?'))
+      .toBe('"beat" OR "Sephiroth" OR "boss" OR "fight"');
+  });
+
+  it('dedupes repeated tokens', () => {
+    expect(sanitizeFtsQuery('Sephiroth boss Sephiroth')).toBe('"Sephiroth" OR "boss"');
+  });
+
+  it('returns empty string for whitespace-only or empty input', () => {
+    expect(sanitizeFtsQuery('')).toBe('');
+    expect(sanitizeFtsQuery('   ')).toBe('');
+    expect(sanitizeFtsQuery('!!!???')).toBe('');
+  });
+
+  it('preserves unicode letters and digits', () => {
+    expect(sanitizeFtsQuery('Pokémon Red')).toBe('"Pokémon" OR "Red"');
+    expect(sanitizeFtsQuery('FF7 boss 99')).toBe('"FF7" OR "boss" OR "99"');
   });
 });

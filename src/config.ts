@@ -11,6 +11,12 @@ export const config = {
   // Archive settings
   archiveUrl: process.env.ARCHIVE_URL || 'https://archive.org/compress/Gamespot_Gamefaqs_TXTs/formats=7Z&file=/Gamespot_Gamefaqs_TXTs.zip',
   tempDir: process.env.TEMP_DIR || '/tmp/gamefaqs',
+  // Where the downloaded archive lives. Decoupled from tempDir so an operator
+  // can mount this from a stable host path and survive `docker compose down -v`
+  // without losing the ~12 GB download. Falls back to tempDir for backwards
+  // compatibility. The directory will be created if missing; the archive file
+  // inside is reused on next start when its size matches the remote size.
+  archiveDir: process.env.ARCHIVE_DIR || process.env.TEMP_DIR || '/tmp/gamefaqs',
   // Set KEEP_ARCHIVE=true to retain gamefaqs_archive.zip after extraction so a
   // future fresh setup can skip the ~12 GB download. Default deletes it after
   // extract to free disk during import.

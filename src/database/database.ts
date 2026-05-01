@@ -28,6 +28,17 @@ export class DatabaseService implements IDatabase {
     // WAL mode: better for large imports, reduces peak disk usage
     this.db.pragma('journal_mode = WAL');
 
+    // Sized for a 13 GB-RAM host that also runs Ollama and other containers.
+    // cache_size is committed-ish memory: 256 MiB keeps the FTS5/vec0 insertion
+    // hotspots resident during indexing without crowding Ollama. mmap_size is
+    // a *ceiling*, not an allocation — SQLite only pages in what it touches
+    // and the kernel reclaims unused mappings under memory pressure, so 2 GiB
+    // is safe even with limited RAM. temp_store=MEMORY keeps temp sorts/joins
+    // in RAM.
+    this.db.pragma('cache_size = -262144');      // 256 MiB
+    this.db.pragma('mmap_size = 2147483648');    // 2 GiB ceiling
+    this.db.pragma('temp_store = MEMORY');
+
     // Best-effort load of sqlite-vec for vector search (must run before migrations
     // so v5 can decide whether to create the chunk_embeddings vec0 virtual table)
     this.loadVectorExtension();
