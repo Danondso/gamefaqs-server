@@ -1753,10 +1753,11 @@ router.get('/panel', (req: Request, res: Response) => {
       document.getElementById('indexFailed').textContent = formatCount(progress.failedGuides);
       document.getElementById('indexChunks').textContent = formatCount(progress.totalChunks);
 
-      // Cumulative position: snapshot at page-load + this run's increments.
-      // (processedGuides resets on each start, so no double-counting.)
-      const cumulativeIndexed = indexDbStats.indexedGuides + (isRunning ? (progress.processedGuides || 0) : 0);
-      const cumulativeTotal = indexDbStats.totalGuides;
+      // Cumulative position is computed server-side from a live DB count, so
+      // it stays correct regardless of when the panel was opened relative to
+      // the run.
+      const cumulativeIndexed = progress.cumulativeIndexed || 0;
+      const cumulativeTotal = progress.cumulativeTotal || 0;
       const pct = cumulativeTotal > 0
         ? Math.min(100, Math.round((cumulativeIndexed / cumulativeTotal) * 100))
         : 0;

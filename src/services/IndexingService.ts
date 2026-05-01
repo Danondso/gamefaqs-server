@@ -13,11 +13,15 @@ import { EmbeddingService } from './EmbeddingService';
 
 export interface IndexProgress {
   status: 'idle' | 'running' | 'stopping' | 'complete' | 'error';
+  // Per-run counters (reset on each start)
   totalGuides: number;
   processedGuides: number;
   succeededGuides: number;
   failedGuides: number;
   totalChunks: number;
+  // Whole-archive counters (live from DB, not affected by run boundaries)
+  cumulativeIndexed: number;
+  cumulativeTotal: number;
   currentGuideId?: string;
   currentGuideTitle?: string;
   message: string;
@@ -44,6 +48,8 @@ const initialProgress = (): IndexProgress => ({
   succeededGuides: 0,
   failedGuides: 0,
   totalChunks: 0,
+  cumulativeIndexed: 0,
+  cumulativeTotal: 0,
   message: 'Idle',
 });
 
@@ -64,7 +70,17 @@ export class IndexingService {
   }
 
   getProgress(): IndexProgress {
-    return { ...this.progress };
+    // Cumulative counters come straight from the DB so callers can't drift
+    // from truth (e.g., when the panel is opened mid-run, when force-mode
+    // re-indexes already-indexed guides, or after restarts). The per-run
+    // counters in this.progress are still authoritative for the in-flight run.
+    const cumulativeIndexed = this.db.get<{ c: number }>(
+      'SELECT COUNT(*) as c FROM guides WHERE indexed_at IS NOT NULL'
+    )?.c ?? 0;
+    const cumulativeTotal = this.db.get<{ c: number }>(
+      'SELECT COUNT(*) as c FROM guides'
+    )?.c ?? 0;
+    return { ...this.progress, cumulativeIndexed, cumulativeTotal };
   }
 
   // Persistent counts from the DB — survive process restarts and reflect work
