@@ -32,8 +32,12 @@ npm run docker:mcp:build # Build MCP server Docker image (Dockerfile.mcp)
 - `InitService` - Orchestrates startup: download → extract → import
 - `ArchiveDownloadService` - Streaming HTTP downloads with progress callbacks
 - `ArchiveExtractor` - ZIP + 7z extraction
-- `GuideImporter` - Recursive directory scan, batch database inserts
-- `GuideParser` - Extracts metadata from guide files
+- `GuideImporter` - Recursive directory scan, batch database inserts. Composes guide title as `${gameName}` or `${gameName} — ${author}` (the parser's content-extracted title is unreliable — banners/bylines slip through); the original parsed title is preserved in `metadata.original_title`. The `cleanAuthor` filter (length 2..60, no `|=>` chars, ≤ 5 spaces) must stay in sync with the SQL CASE in migration v7.
+- `GuideParser` - Extracts metadata from guide files. `titleCaseGameName()` handles lowercase particles (`of`, `the`, ...) and uppercases roman numerals II..XX (so `final-fantasy-vii` → `Final Fantasy VII`).
+- `Chunker` / `IndexingService` / `EmbeddingService` - RAG indexing pipeline. Indexing writes chunks to SQLite (inside a per-guide transaction) and the embedding to `AnnIndex` (USearch HNSW i8) outside the transaction — vectors live in the ANN file, never in SQLite.
+- `AnnIndex` (`src/services/AnnIndex.ts`) - USearch HNSW i8 wrapper keyed by `chunks.rowid`. Backing file at `${dbPath}.ann`; loaded at startup or starts empty for the indexer to populate. Saves periodically during indexing (every `ANN_SAVE_EVERY_GUIDES`) and on shutdown via `Database.close()`.
+- `RetrievalService` - Hybrid retrieval over three sources fused with reciprocal-rank: (1) vector KNN via `AnnIndex` (returns chunk rowids → hydrated to chunk_ids), (2) BM25 over `chunks_fts` with **rare-token filtering** via `chunks_fts_vocab` — tokens whose document frequency exceeds 5% of the corpus are dropped before BM25, capped at the rarest 5 tokens (this single change cut chunk-FTS p50 from 1.4s → 144ms post-USearch), (3) title-aware BM25 over `guides_fts_meta` (every chunk of a title-matched guide enters fusion at the guide's title rank). Source 3 is what makes "<aspect> in <game>" questions reliably surface the right guide even when the chunk content doesn't repeat the game's name.
+- `AnswerService` / `SynthesisService` / `OllamaService` - Question answering on top of retrieval.
 
 **Routes (`src/routes/`)**: Express routers for `/api/health`, `/api/guides`, `/api/games`, `/api/admin`
 
@@ -49,9 +53,20 @@ npm run docker:mcp:build # Build MCP server Docker image (Dockerfile.mcp)
 
 ### Database Schema
 
-Tables: `guides`, `games`, `bookmarks`, `notes`, `achievements`, `schema_version`, `guides_fts` (FTS5)
+Core tables: `guides`, `games`, `bookmarks`, `notes`, `achievements`, `schema_version`.
+RAG / search tables: `chunks`, `chunks_fts` (FTS5 over chunk content), `guides_fts_meta` (FTS5 over guide title + tags), plus fts5vocab views `chunks_fts_vocab` and `guides_fts_meta_vocab` for rare-token filtering. Vectors live in the ANN file `${dbPath}.ann`, not in SQLite.
 
-Schema changes require migrations in `src/database/migrations.ts`.
+Current `SCHEMA_VERSION` is **8**. Schema changes require a new migration in `src/database/migrations.ts`. Notable: migration v5 creates `chunks` + `chunks_fts` + insert/delete triggers; migration v7 relabels existing guide titles to `${games.title}` (optionally `— ${author}`) and stashes the old title in `metadata.original_title` — idempotent (rows with `original_title` set are skipped on re-run); migration v8 creates `chunks_fts_vocab` and `guides_fts_meta_vocab` — read-only fts5vocab views used by `RetrievalService.filterToRareChunkTokens` to drop common tokens in O(log n) per token.
+
+### ANN index
+
+The vector store is **USearch HNSW i8** in a single file at `${dbPath}.ann` (override with `ANN_INDEX_PATH`). Keyed by `chunks.rowid`. Picked over libSQL DiskANN and other candidates by the bake-off in `tests/benchmarks/ann-bakeoff/` (recall@8 84-87% end-to-end, p95 vec latency 7ms, 3.3 GB on disk for 3.7M vectors).
+
+On startup, `DatabaseService.openAnnIndex()`:
+1. Loads `${dbPath}.ann` if it exists (~3s for a 3 GB file).
+2. Otherwise, starts empty for the indexer to populate.
+
+The ANN file is *not* part of SQLite ACID. A crash during indexing can leave the index missing the in-flight guide's chunks; recovery is to delete the .ann file and let the indexer re-embed any chunks lacking ANN entries on the next run. Periodic save cadence is `ANN_SAVE_EVERY_GUIDES` (default 100).
 
 ## Environment Variables
 
@@ -61,11 +76,16 @@ DB_PATH=/data/db/gamefaqs.db # SQLite database path (ignored by MCP server in re
 ADMIN_TOKEN=                 # Optional admin authentication (gates /api/admin/* only)
 OLLAMA_HOST=http://localhost:11434  # Optional AI integration
 GAMEFAQS_API_URL=            # Optional — when set, MCP server proxies to this REST API instead of opening local DB
+ANN_INDEX_PATH=              # Optional override for the ANN file location (default `${DB_PATH}.ann`)
+ANN_M=16                     # USearch HNSW connectivity (graph degree)
+ANN_EF_ADD=200               # USearch ef_construction
+ANN_EF_SEARCH=256            # USearch ef_search at query time (higher = better recall, slightly slower)
+ANN_SAVE_EVERY_GUIDES=100    # How often the indexer flushes the ANN file to disk
 ```
 
 ## Development Notes
 
 - TypeScript strict mode enabled
-- No test suite currently configured
-- Initialization downloads ~12GB, extracts to ~15GB, creates ~5-10GB database (needs ~30GB disk)
+- Tests run via `npm test` (vitest, run-once) or `npm run test:watch`. Test layout: unit tests under `tests/`, integration tests under `tests/integration/`, RAG accuracy benchmarks under `tests/benchmarks/`.
+- Initialization downloads ~2.2GB, extracts to ~15GB, creates ~5-10GB database (needs ~30GB disk)
 - Admin panel at `/admin` shows real-time initialization progress via SSE

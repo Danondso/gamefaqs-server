@@ -1,6 +1,8 @@
 // Background indexer: walks guides where indexed_at IS NULL, chunks them,
-// embeds the chunks, and writes both the chunks table and the chunk_embeddings
-// vec0 table in a single transaction per guide. Resumable across restarts:
+// embeds the chunks, and writes the chunks table inside a transaction per
+// guide. Vector embeddings go to the ANN index (USearch HNSW i8) outside the
+// SQL transaction; the index is checkpointed to disk every
+// `ANN_SAVE_EVERY_GUIDES` guides and on shutdown. Resumable across restarts:
 // guides with chunks but no indexed_at retry from scratch (DELETE + re-insert).
 
 import { nanoid } from 'nanoid';
@@ -146,16 +148,12 @@ export class IndexingService {
     const deleteChunksStmt = this.db.getDb().prepare('DELETE FROM chunks WHERE guide_id = ?');
     const updateIndexedAtStmt = this.db.getDb().prepare('UPDATE guides SET indexed_at = ? WHERE id = ?');
 
-    const insertEmbeddingStmt = this.db.vectorSearchAvailable
-      ? this.db.getDb().prepare('INSERT INTO chunk_embeddings(chunk_id, embedding) VALUES (?, ?)')
-      : null;
-    // Per-id delete: vec0 can't push down `chunk_id IN (subquery)` and ends up
-    // scanning the whole embeddings table (~400ms per guide at 1M rows). Direct
-    // PRIMARY KEY deletes are O(log n).
-    const deleteEmbeddingByIdStmt = this.db.vectorSearchAvailable
-      ? this.db.getDb().prepare('DELETE FROM chunk_embeddings WHERE chunk_id = ?')
-      : null;
-    const selectExistingChunkIdsStmt = this.db.getDb().prepare('SELECT id FROM chunks WHERE guide_id = ?');
+    // chunks.rowid → ANN key. Fetched alongside the existing-chunks scan in
+    // writeGuide(), so deletes hit the index by rowid in O(log n).
+    const selectExistingChunkRowidsStmt = this.db.getDb().prepare(
+      'SELECT rowid AS rowid, id AS id FROM chunks WHERE guide_id = ?'
+    );
+    const ann = this.db.annIndex;
 
     // Pipeline state. We always have at most one guide in the "embedding"
     // stage and one in the "loaded + chunked, waiting" stage. Loading the next
@@ -178,8 +176,6 @@ export class IndexingService {
     };
 
     // Loaded once at start; per-guide game lookup uses this prepared statement.
-    // Most guides are linked to a game (143376/143376 in the current archive);
-    // the LEFT JOIN handles the unlikely orphan case without erroring.
     const selectGameStmt = this.db.getDb().prepare(
       'SELECT title, platform FROM games WHERE id = ?'
     );
@@ -187,14 +183,14 @@ export class IndexingService {
     // Build the per-chunk prefix. The format is a single line so it lives
     // outside the natural prose flow but still tokenizes cleanly for both
     // FTS5 (BM25 picks up "Final Fantasy VII") and the embedding model
-    // (gives chunks a strong "this is from <game>" signal). Empty string
+    // (gives chunks a strong "this is from <game>" signal). Empty prefix
     // disables prefixing for orphan guides.
-    const buildGamePrefix = (gameId: string | null): string => {
-      if (!gameId) return '';
+    const lookupGameContext = (gameId: string | null): { prefix: string } => {
+      if (!gameId) return { prefix: '' };
       const game = selectGameStmt.get(gameId) as { title: string; platform: string | null } | undefined;
-      if (!game?.title) return '';
+      if (!game?.title) return { prefix: '' };
       const platform = game.platform ? ` (${game.platform})` : '';
-      return `Game: ${game.title}${platform}`;
+      return { prefix: `Game: ${game.title}${platform}` };
     };
 
     const loadAndChunkNext = (): Loaded | null => {
@@ -212,7 +208,7 @@ export class IndexingService {
         chunkSizeTokens: config.chunkSizeTokens,
         chunkOverlapTokens: config.chunkOverlapTokens,
       });
-      const gamePrefix = buildGamePrefix(guide.game_id ?? null);
+      const { prefix: gamePrefix } = lookupGameContext(guide.game_id ?? null);
       return { guide, chunks, gamePrefix };
     };
 
@@ -227,18 +223,23 @@ export class IndexingService {
 
     const writeGuide = (loaded: Loaded, vectors: Float32Array[]): void => {
       const { guide, chunks, gamePrefix } = loaded;
+      // ANN updates run *outside* the SQL transaction. The ANN file isn't
+      // part of the SQLite ACID story; the worst-case crash window leaves
+      // ANN out of sync with chunks for the in-flight guide. Recovery: delete
+      // the .ann file and the indexer will re-embed any chunks lacking a
+      // corresponding ANN entry on the next run (paid via Ollama).
+      const insertedRowids: number[] = [];
+
       this.db.transaction(() => {
-        // Cleanup is conditional on existing rows because vec0 can't push down
-        // `chunk_id IN (subquery)` and would scan the whole embeddings table
-        // otherwise (~400ms per guide at ~1M rows). For first-time indexing
-        // (the common case) there are no rows to delete and we skip both
-        // statements; for force/retry runs we delete by primary key one row
-        // at a time, which is O(log n).
-        const existing = selectExistingChunkIdsStmt.all(guide.id) as { id: string }[];
+        // For force/retry runs, drop the existing chunks AND remove their
+        // ANN keys. ANN deletes happen here (still inside the txn boundary
+        // for symmetry; if the SQL txn rolls back, we accept the temporary
+        // ANN drift over a missed delete).
+        const existing = selectExistingChunkRowidsStmt.all(guide.id) as { rowid: number; id: string }[];
         if (existing.length > 0) {
-          if (deleteEmbeddingByIdStmt) {
+          if (ann) {
             for (const row of existing) {
-              deleteEmbeddingByIdStmt.run(row.id);
+              try { ann.remove(row.rowid); } catch (_e) { /* not in index — fine */ }
             }
           }
           deleteChunksStmt.run(guide.id);
@@ -253,13 +254,37 @@ export class IndexingService {
           // users will include the "Game: X" line at the top — that doubles
           // as helpful citation context.
           const indexedContent = composeIndexedContent(gamePrefix, c.content);
-          insertChunkStmt.run(chunkId, guide.id, c.index, indexedContent, c.charStart, c.charEnd, c.tokenCount, now);
-          if (insertEmbeddingStmt) {
-            insertEmbeddingStmt.run(chunkId, Buffer.from(vectors[i].buffer));
-          }
+          const r = insertChunkStmt.run(chunkId, guide.id, c.index, indexedContent, c.charStart, c.charEnd, c.tokenCount, now);
+          insertedRowids.push(Number(r.lastInsertRowid));
         }
         updateIndexedAtStmt.run(now, guide.id);
       });
+
+      // ANN inserts after the SQL commit. If this throws, the SQL state is
+      // consistent (chunks exist) but the ANN is missing the new chunks for
+      // this guide — the next bootstrap (or a manual rebuild) will recover.
+      if (ann && insertedRowids.length > 0) {
+        for (let i = 0; i < insertedRowids.length; i++) {
+          ann.add(insertedRowids[i], vectors[i]);
+        }
+      }
+    };
+
+    // Periodic ANN persistence. Saving the full ~3 GB index is ~2s of IO;
+    // doing it every N guides bounds crash-recovery loss to ~N guides without
+    // pegging the disk. Configurable via ANN_SAVE_EVERY_GUIDES.
+    let guidesSinceSave = 0;
+    const maybeSaveAnn = (): void => {
+      if (!ann) return;
+      if (guidesSinceSave < config.annSaveEveryGuides) return;
+      try {
+        if (ann.saveIfDirty()) {
+          console.log(`[Indexing] saved ANN index (after ${guidesSinceSave} guides)`);
+        }
+      } catch (err: any) {
+        console.error('[Indexing] ANN save failed (non-fatal):', err.message);
+      }
+      guidesSinceSave = 0;
     };
 
     const recordFailure = (guideId: string, err: any): void => {
@@ -334,6 +359,8 @@ export class IndexingService {
           writeGuide(current, vectors);
           this.progress.totalChunks += chunks.length;
           this.progress.succeededGuides++;
+          guidesSinceSave++;
+          maybeSaveAnn();
         } catch (err: any) {
           if (isEmbeddingUnreachable(err)) {
             // Embedding service is gone — every subsequent guide will hit
@@ -365,6 +392,9 @@ export class IndexingService {
         this.progress.currentGuideTitle = undefined;
         this.notify();
         console.log('[Indexing] complete');
+        // Persist any pending ANN writes — server may run for a long time after
+        // ingest finishes, and we don't want to lose them on a later crash.
+        this.flushAnn();
         return;
       }
 
@@ -381,12 +411,26 @@ export class IndexingService {
         this.progress.message = `Indexing complete (limit reached): ${this.progress.succeededGuides} ok, ${this.progress.failedGuides} failed`;
         this.notify();
       }
+      this.flushAnn();
     } catch (err: any) {
       this.progress.status = 'error';
       this.progress.error = err.message;
       this.progress.message = `Error: ${err.message}`;
       this.notify();
       console.error('[Indexing] fatal error:', err);
+      this.flushAnn();
+    }
+  }
+
+  private flushAnn(): void {
+    const ann = this.db.annIndex;
+    if (!ann) return;
+    try {
+      if (ann.saveIfDirty()) {
+        console.log('[Indexing] saved ANN index (final flush)');
+      }
+    } catch (err: any) {
+      console.error('[Indexing] ANN final save failed (non-fatal):', err.message);
     }
   }
 

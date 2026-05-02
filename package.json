@@ -30,8 +30,8 @@
     "nanoid": "^5.1.6",
     "node-7z": "^3.0.0",
     "ollama": "^0.6.3",
-    "sqlite-vec": "^0.1.9",
     "swagger-ui-express": "^5.0.1",
+    "usearch": "^2.25.1",
     "yauzl": "^3.2.0"
   },
   "devDependencies": {
@@ -44,6 +44,7 @@
     "@types/yauzl": "^2.10.3",
     "@vitest/coverage-v8": "^4.0.18",
     "esbuild": "^0.28.0",
+    "libsql": "^0.5.29",
     "nodemon": "^3.1.11",
     "supertest": "^7.2.2",
     "ts-node": "^10.9.2",

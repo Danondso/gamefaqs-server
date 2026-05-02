@@ -2,13 +2,19 @@
 //
 // Algorithm:
 //   1. Embed the question.
-//   2. KNN over chunk_embeddings (sqlite-vec) AND BM25 over chunks_fts.
+//   2. KNN via the ANN index (USearch HNSW i8) AND BM25 over chunks_fts.
 //      When game/platform filters are present, vec search over-fetches by 5×
 //      because filters are applied post-hoc and a strict KNN window can be
 //      starved by non-matching rows.
-//   3. Reciprocal-rank fusion: each chunk's score = Σ_source 1/(rrfK + rank).
-//      Chunks present in both lists sum their contributions. Sort desc, take topK.
-//   4. Hydrate to Citation[] in one round trip.
+//   3. Title-aware boost: BM25 over guides_fts_meta(title, tags). Every chunk
+//      belonging to a title-matched guide enters fusion at the guide's title
+//      rank. This is what makes "<aspect> in <game>" questions reliably
+//      surface guides for the named game even when the chunk content doesn't
+//      repeat the game's name (e.g. a Diablo 2 mechanics chunk that doesn't
+//      say "Diablo" itself).
+//   4. Reciprocal-rank fusion: each chunk's score = Σ_source 1/(rrfK + rank).
+//      Chunks present in multiple lists sum their contributions. Sort desc, take topK.
+//   5. Hydrate to Citation[] in one round trip.
 
 import { performance } from 'perf_hooks';
 import type { IDatabase } from '../interfaces/IDatabase';
@@ -41,22 +47,50 @@ export interface FtsHit {
   rank: number;
 }
 
+export interface TitleHit {
+  guide_id: string;
+  rank: number;
+}
+
 export type VectorSearchFn = (queryVector: Float32Array, k: number) => VectorHit[];
 export type FtsSearchFn = (query: string, limit: number) => FtsHit[];
+export type TitleSearchFn = (query: string, limit: number) => TitleHit[];
 
 export interface RetrievalServiceOpts {
   db: IDatabase;
   embeddingService: EmbeddingService;
   ftsLimit?: number;
   vecLimit?: number;
+  titleLimit?: number;
   rrfK?: number;
-  // Test seams. If omitted, defaults wrap the db with sqlite-vec / FTS5 SQL.
+  // Test seams. If omitted, defaults wrap the ANN index / FTS5 SQL.
   vectorSearch?: VectorSearchFn;
   ftsSearch?: FtsSearchFn;
+  titleSearch?: TitleSearchFn;
 }
 
 const EXCERPT_CHARS = 300;
 const FILTER_OVERFETCH = 5;
+// Cap on how many tokens we forward to title-FTS after rarity filtering.
+// More than 3 tends to dilute the rare-token signal that we're trying to
+// preserve.
+const TITLE_TOKEN_BUDGET = 3;
+// Cap on how many tokens we forward to chunk-FTS after rarity filtering.
+// Larger than the title budget because chunk content is longer and more
+// varied — keeping a couple extra rare tokens helps retrieve specific
+// passages even when the dominant term doesn't appear in every relevant
+// chunk. Rationale for the gate: chunk-FTS dominated retrieval p95 (94%
+// of total wall time) before this filter was added. 5 is the empirically
+// chosen sweet spot — 4 dropped Pokemon Red Elite Four below recall (only
+// 'Elite' was rare enough), and 6+ readmits common-ish tokens that drag
+// p95 back up.
+const CHUNK_TOKEN_BUDGET = 5;
+// Maximum DF for a chunk-FTS token to count as "rare". Tokens above this
+// threshold get dropped from the chunk-FTS query, since BM25 ranking over
+// millions of candidate chunks dominates wall-clock latency. Per-token DF
+// is read from the fts5vocab virtual table created in migration v9.
+const CHUNK_RARE_DF_FRACTION = 0.05;
+const CHUNK_RARE_DF_MIN = 5000;
 
 interface ChunkRow {
   id: string;
@@ -73,18 +107,24 @@ export class RetrievalService {
   private readonly embeddings: EmbeddingService;
   private readonly ftsLimit: number;
   private readonly vecLimit: number;
+  private readonly titleLimit: number;
   private readonly rrfK: number;
   private readonly vectorSearch: VectorSearchFn;
   private readonly ftsSearch: FtsSearchFn;
+  private readonly titleSearch: TitleSearchFn;
 
   constructor(opts: RetrievalServiceOpts) {
     this.db = opts.db;
     this.embeddings = opts.embeddingService;
     this.ftsLimit = opts.ftsLimit ?? 20;
     this.vecLimit = opts.vecLimit ?? 20;
+    // Capped lower than chunk-level limits — title-matched guides expand into
+    // (potentially many) chunks, and a too-wide title-match list dominates RRF.
+    this.titleLimit = opts.titleLimit ?? 10;
     this.rrfK = opts.rrfK ?? 60;
     this.vectorSearch = opts.vectorSearch ?? this.defaultVectorSearch.bind(this);
     this.ftsSearch = opts.ftsSearch ?? this.defaultFtsSearch.bind(this);
+    this.titleSearch = opts.titleSearch ?? this.defaultTitleSearch.bind(this);
   }
 
   async retrieve(question: string, filters: RetrievalFilters, topK: number): Promise<Citation[]> {
@@ -109,37 +149,69 @@ export class RetrievalService {
     const tRetrieveStart = now();
     let vecHits: VectorHit[] = [];
     let ftsHits: FtsHit[] = [];
+    let titleHits: TitleHit[] = [];
 
     try {
       vecHits = this.vectorSearch(queryVec, vecK);
     } catch (err: any) {
-      // sqlite-vec might not be loaded; fall back to FTS-only retrieval.
+      // ANN index missing or corrupt; fall back to FTS-only retrieval. The
+      // operator should delete the .ann file and let the indexer re-embed
+      // any chunks lacking ANN entries.
       console.warn('[Retrieval] vector search failed, continuing with FTS only:', err.message);
     }
 
     // FTS5 chokes on raw user input: `?`, `!`, parentheses, and bare AND/OR/NOT
-    // are all reserved syntax. The previous fallback wrapped the entire question
-    // in quotes, which turns it into a phrase search ("the literal sentence
-    // appears verbatim") — that never matches a chunk and silently zeros out
-    // the FTS contribution to RRF. Strip operator chars and quote each token
-    // individually so the tokens AND together as plain terms.
-    const ftsQuery = sanitizeFtsQuery(question);
+    // are all reserved syntax. Strip operator chars and quote each token
+    // individually so the tokens OR together as plain terms.
+    //
+    // Rarity filter: chunk-FTS used to dominate retrieval p95 (94% of wall
+    // time) because OR'ing common tokens like "first", "puzzle", "secret"
+    // forced BM25 to score millions of candidates. We mirror what title-FTS
+    // does — drop tokens whose document-frequency in `chunks_fts` exceeds
+    // ~5% of the corpus — capped at CHUNK_TOKEN_BUDGET. Vague questions
+    // ("How do I beat the second boss?") with no rare tokens were already
+    // misses; degrading their FTS contribution doesn't add new failures.
+    const tokens = extractFtsTokens(question);
+    const chunkTokens = this.filterToRareChunkTokens(tokens);
+    const ftsQuery = tokensToFtsQuery(chunkTokens);
     try {
       ftsHits = ftsQuery ? this.ftsSearch(ftsQuery, this.ftsLimit) : [];
     } catch (err: any) {
-      // Should not happen after sanitization, but if it does we fall back to
-      // vector-only retrieval rather than failing the whole request.
       console.warn('[Retrieval] FTS search failed after sanitization:', err.message);
     }
+
+    // Title-FTS uses only the rare/discriminating tokens. With OR'd query
+    // tokens, BM25 will rank a title that repeats common words ("Best of the
+    // Best Championship Karate") above a title that matches only the rare
+    // game-name token ("Diablo II"). Filtering to rare tokens before the
+    // title query fixes that.
+    const titleTokens = this.filterToRareTitleTokens(tokens);
+    const titleQuery = tokensToFtsQuery(titleTokens);
+    try {
+      titleHits = titleQuery ? this.titleSearch(titleQuery, this.titleLimit) : [];
+    } catch (err: any) {
+      console.warn('[Retrieval] title search failed:', err.message);
+    }
+
+    // Expand title hits → chunks. Every chunk in a title-matched guide enters
+    // RRF at that guide's title rank, so all chunks of the top-titled guide
+    // get the same boost; vec/FTS pick the best chunk within.
+    const titleChunkHits = this.expandTitleHitsToChunks(titleHits);
 
     // Apply filters before fusion so RRF rank reflects post-filter ordering.
     let filteredVec: VectorHit[] = vecHits;
     let filteredFts: FtsHit[] = ftsHits;
+    let filteredTitle: { chunk_id: string; rank: number }[] = titleChunkHits;
     if (hasFilters) {
-      const candidateIds = new Set([...vecHits, ...ftsHits].map(h => h.chunk_id));
+      const candidateIds = new Set([
+        ...vecHits.map(h => h.chunk_id),
+        ...ftsHits.map(h => h.chunk_id),
+        ...titleChunkHits.map(h => h.chunk_id),
+      ]);
       const allowed = this.filterChunkIds(candidateIds, filters);
       filteredVec = vecHits.filter(h => allowed.has(h.chunk_id));
       filteredFts = ftsHits.filter(h => allowed.has(h.chunk_id));
+      filteredTitle = titleChunkHits.filter(h => allowed.has(h.chunk_id));
     }
 
     // RRF fusion. Rank within each list (1-indexed) is its position after
@@ -150,6 +222,12 @@ export class RetrievalService {
     });
     filteredFts.forEach((h, i) => {
       scores.set(h.chunk_id, (scores.get(h.chunk_id) ?? 0) + 1 / (this.rrfK + (i + 1)));
+    });
+    // Title-source rank is the GUIDE's rank (already in `h.rank`), not the
+    // chunk's position in the expanded list — all chunks of guide-rank 0 share
+    // the same boost.
+    filteredTitle.forEach(h => {
+      scores.set(h.chunk_id, (scores.get(h.chunk_id) ?? 0) + 1 / (this.rrfK + (h.rank + 1)));
     });
 
     const ranked = Array.from(scores.entries())
@@ -225,14 +303,26 @@ export class RetrievalService {
     return new Set(rows.map(r => r.id));
   }
 
+  // KNN via the ANN index (USearch HNSW i8). Sub-10ms p95 at 3.7M vectors.
+  // The ANN keys are chunks.rowid (uint64); we hydrate to chunk_id via a
+  // single SQL round trip preserving distance order.
   private defaultVectorSearch(queryVec: Float32Array, k: number): VectorHit[] {
-    if (!this.db.vectorSearchAvailable) return [];
-    const buf = Buffer.from(queryVec.buffer, queryVec.byteOffset, queryVec.byteLength);
-    return this.db.query<VectorHit>(
-      `SELECT chunk_id, distance FROM chunk_embeddings
-       WHERE embedding MATCH ? AND k = ? ORDER BY distance`,
-      [buf, k]
+    const ann = this.db.annIndex;
+    if (!ann) return [];
+    const hits = ann.search(queryVec, k);
+    if (hits.length === 0) return [];
+    const placeholders = hits.map(() => '?').join(',');
+    const rows = this.db.query<{ rowid: number; chunk_id: string }>(
+      `SELECT rowid, id AS chunk_id FROM chunks WHERE rowid IN (${placeholders})`,
+      hits.map((h) => h.rowid)
     );
+    const byRowid = new Map(rows.map((r) => [r.rowid, r.chunk_id]));
+    const out: VectorHit[] = [];
+    for (const h of hits) {
+      const chunk_id = byRowid.get(h.rowid);
+      if (chunk_id !== undefined) out.push({ chunk_id, distance: h.distance });
+    }
+    return out;
   }
 
   private defaultFtsSearch(query: string, limit: number): FtsHit[] {
@@ -240,6 +330,141 @@ export class RetrievalService {
       `SELECT chunk_id, rank FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?`,
       [query, limit]
     );
+  }
+
+  private defaultTitleSearch(query: string, limit: number): TitleHit[] {
+    return this.db.query<TitleHit>(
+      `SELECT guide_id, rank FROM guides_fts_meta WHERE guides_fts_meta MATCH ? ORDER BY rank LIMIT ?`,
+      [query, limit]
+    );
+  }
+
+  // Drop tokens whose document-frequency in guides_fts_meta makes them
+  // non-discriminating. Threshold is max(50, 5% of indexed titles): a token
+  // appearing in more than that many titles ("best", "class", "level", "boss")
+  // would otherwise dominate BM25 ranking and crowd out genuine game-name
+  // matches. Returns a (possibly empty) subset of `tokens` ordered by ascending
+  // DF — rarest first. Capped at TITLE_TOKEN_BUDGET to keep the OR query small.
+  private filterToRareTitleTokens(tokens: string[]): string[] {
+    if (tokens.length === 0) return [];
+    const total = this.totalTitlesIndexed();
+    if (total === 0) return [];
+    const threshold = Math.max(50, Math.floor(total * 0.05));
+
+    const dfs: { token: string; df: number }[] = [];
+    for (const token of tokens) {
+      try {
+        const row = this.db.query<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM guides_fts_meta WHERE guides_fts_meta MATCH ?`,
+          [`"${token}"`]
+        )[0];
+        const df = row?.n ?? 0;
+        if (df > 0 && df <= threshold) dfs.push({ token, df });
+      } catch {
+        // Malformed token (shouldn't happen post-sanitize) — skip.
+      }
+    }
+    dfs.sort((a, b) => a.df - b.df);
+    return dfs.slice(0, TITLE_TOKEN_BUDGET).map(d => d.token);
+  }
+
+  // Chunk-FTS rarity filter. Same shape as filterToRareTitleTokens but reads
+  // DF from the fts5vocab over chunks_fts (created in migration v9), which
+  // is O(log n) per token vs O(n) for `chunks_fts MATCH ?`. Tokens above the
+  // rarity threshold are dropped; the survivors are sorted by ascending DF
+  // and capped at CHUNK_TOKEN_BUDGET. Falls back to "all tokens, no filter"
+  // if the vocab table is unavailable (older DBs that haven't run v9).
+  private filterToRareChunkTokens(tokens: string[]): string[] {
+    if (tokens.length === 0) return tokens;
+    const total = this.totalChunksIndexed();
+    if (total === 0) return tokens;
+    const threshold = Math.max(CHUNK_RARE_DF_MIN, Math.floor(total * CHUNK_RARE_DF_FRACTION));
+
+    let vocabAvailable = true;
+    const dfs: { token: string; df: number }[] = [];
+    for (const token of tokens) {
+      try {
+        const row = this.db.query<{ doc: number }>(
+          `SELECT doc FROM chunks_fts_vocab WHERE term = ?`,
+          [token.toLowerCase()]
+        )[0];
+        const df = row?.doc ?? 0;
+        // Include tokens whose DF is either 0 (token absent or not yet
+        // indexed; FTS will harmlessly return nothing for them) or below the
+        // rarity threshold. Drop only tokens that are demonstrably common.
+        if (df <= threshold) dfs.push({ token, df });
+      } catch {
+        // Vocab table doesn't exist (pre-v9 DB) — bail out and keep all tokens
+        // so we don't silently degrade recall.
+        vocabAvailable = false;
+        break;
+      }
+    }
+    if (!vocabAvailable) return tokens;
+    dfs.sort((a, b) => a.df - b.df);
+    return dfs.slice(0, CHUNK_TOKEN_BUDGET).map(d => d.token);
+  }
+
+  private cachedChunkTotal: number | null = null;
+  private cachedChunkTotalAt = 0;
+
+  private totalChunksIndexed(): number {
+    const now = Date.now();
+    if (this.cachedChunkTotal !== null && now - this.cachedChunkTotalAt < 60_000) {
+      return this.cachedChunkTotal;
+    }
+    try {
+      const row = this.db.query<{ n: number }>(`SELECT COUNT(*) AS n FROM chunks`)[0];
+      this.cachedChunkTotal = row?.n ?? 0;
+    } catch {
+      this.cachedChunkTotal = 0;
+    }
+    this.cachedChunkTotalAt = now;
+    return this.cachedChunkTotal;
+  }
+
+  private cachedTitleTotal: number | null = null;
+  private cachedTitleTotalAt = 0;
+
+  private totalTitlesIndexed(): number {
+    // Total grows during ingest but not per-request — cache for a minute so
+    // we're not running COUNT(*) on every retrieval call.
+    const now = Date.now();
+    if (this.cachedTitleTotal !== null && now - this.cachedTitleTotalAt < 60_000) {
+      return this.cachedTitleTotal;
+    }
+    try {
+      const row = this.db.query<{ n: number }>(`SELECT COUNT(*) AS n FROM guides_fts_meta`)[0];
+      this.cachedTitleTotal = row?.n ?? 0;
+    } catch {
+      this.cachedTitleTotal = 0;
+    }
+    this.cachedTitleTotalAt = now;
+    return this.cachedTitleTotal;
+  }
+
+  // Each TitleHit carries a guide-level rank; we emit one entry per chunk in
+  // that guide so RRF can blend with the chunk-level vec/FTS sources. Chunks
+  // inherit the guide's rank (i.e. all chunks of guide-rank 0 score the same
+  // title-source contribution).
+  private expandTitleHitsToChunks(hits: TitleHit[]): { chunk_id: string; rank: number }[] {
+    if (hits.length === 0) return [];
+    const guideIds = hits.map(h => h.guide_id);
+    const rankByGuide = new Map<string, number>();
+    hits.forEach((h, i) => {
+      // Use the position in the title-FTS result list as the "rank" so RRF
+      // sees a stable 0-indexed rank regardless of how negative BM25's `rank`
+      // column can get.
+      rankByGuide.set(h.guide_id, i);
+    });
+    const placeholders = guideIds.map(() => '?').join(',');
+    const rows = this.db.query<{ id: string; guide_id: string }>(
+      `SELECT id, guide_id FROM chunks WHERE guide_id IN (${placeholders})`,
+      guideIds
+    );
+    return rows
+      .map(r => ({ chunk_id: r.id, rank: rankByGuide.get(r.guide_id) ?? hits.length }))
+      .sort((a, b) => a.rank - b.rank);
   }
 }
 
@@ -268,7 +493,7 @@ const STOPWORDS = new Set([
   'not','no','nor','so','than','too','very','just','also','only','own','same','such','any','some','all','each','every','few','more','most','other','another',
 ]);
 
-export function sanitizeFtsQuery(question: string): string {
+export function extractFtsTokens(question: string): string[] {
   // Replace anything that isn't a letter, digit, or whitespace with a space.
   // This catches ?, !, (), ", -, +, ^, *, etc.
   const cleaned = question.replace(/[^\p{L}\p{N}\s]/gu, ' ');
@@ -288,8 +513,16 @@ export function sanitizeFtsQuery(question: string): string {
     seen.add(lower);
     tokens.push(raw);
   }
+  return tokens;
+}
+
+export function tokensToFtsQuery(tokens: string[]): string {
   if (tokens.length === 0) return '';
   // Quote each token so reserved-keyword-shaped terms are treated as literals;
   // OR them so BM25 can rank chunks by how many specific terms hit.
   return tokens.map(t => `"${t}"`).join(' OR ');
+}
+
+export function sanitizeFtsQuery(question: string): string {
+  return tokensToFtsQuery(extractFtsTokens(question));
 }

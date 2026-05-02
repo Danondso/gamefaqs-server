@@ -1,7 +1,7 @@
 // SQLite database schema definitions
 // Ported from gamefaqs-reader mobile app
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 8;
 
 export const CREATE_TABLES = {
   guides: `
@@ -146,19 +146,11 @@ export const CREATE_INDEXES = {
   chunks_guide_id: 'CREATE INDEX IF NOT EXISTS idx_chunks_guide_id ON chunks(guide_id);',
 };
 
-// DDL for the RAG chunk-level search infrastructure. These are applied lazily by
-// migration v5: the vec0 virtual table needs the sqlite-vec extension loaded into
-// the connection, the FTS5 / chunks_fts triggers do not.
-// `chunkEmbeddingsDim` is parameterised so a future config bump (e.g. switching
-// embedding models) doesn't require editing the DDL string by hand.
+// DDL for the RAG chunk-level search infrastructure. Vectors live in the ANN
+// file (see `AnnIndex`), not in SQLite. The chunks_fts table backs BM25
+// retrieval; chunks_fts_vocab is created by migration v8 for rare-token
+// filtering.
 export const RAG_DDL = {
-  chunkEmbeddings: (dim: number): string => `
-    CREATE VIRTUAL TABLE IF NOT EXISTS chunk_embeddings USING vec0(
-      chunk_id TEXT PRIMARY KEY,
-      embedding FLOAT[${dim}]
-    );
-  `,
-
   chunksFts: `
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
       chunk_id UNINDEXED,

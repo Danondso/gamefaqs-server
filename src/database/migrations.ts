@@ -1,15 +1,10 @@
 import Database from 'better-sqlite3';
 import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH, FILTER_LOOKUP_TRIGGERS, RAG_DDL, SCHEMA_VERSION } from './schema';
-import { config } from '../config';
-
-export interface MigrationContext {
-  vectorSearchAvailable: boolean;
-}
 
 export interface Migration {
   version: number;
-  up: (db: Database.Database, ctx: MigrationContext) => void;
-  down?: (db: Database.Database, ctx: MigrationContext) => void;
+  up: (db: Database.Database) => void;
+  down?: (db: Database.Database) => void;
 }
 
 // Migration v1: Initial schema
@@ -142,11 +137,12 @@ const migration_v4: Migration = {
   },
 };
 
-// Migration v5: Add chunks table, FTS5 chunk index, and (optionally) vec0 embeddings table for RAG
+// Migration v5: Add chunks table and FTS5 chunk index for RAG. Vectors live
+// in the ANN file (`${dbPath}.ann`, see AnnIndex), not in SQLite.
 const migration_v5: Migration = {
   version: 5,
-  up: (db: Database.Database, ctx: MigrationContext) => {
-    console.log('[Migrations] Adding RAG schema (chunks + FTS + embeddings)...');
+  up: (db: Database.Database) => {
+    console.log('[Migrations] Adding RAG schema (chunks + FTS)...');
 
     // guides.indexed_at: per-guide checkpoint for the indexer
     db.exec('ALTER TABLE guides ADD COLUMN indexed_at INTEGER');
@@ -160,13 +156,6 @@ const migration_v5: Migration = {
     db.exec(RAG_DDL.chunksFtsInsert);
     db.exec(RAG_DDL.chunksFtsDelete);
 
-    if (ctx.vectorSearchAvailable) {
-      db.exec(RAG_DDL.chunkEmbeddings(config.embeddingDim));
-      console.log(`[Migrations] Created chunk_embeddings vec0 table (dim=${config.embeddingDim})`);
-    } else {
-      console.warn('[Migrations] sqlite-vec unavailable — skipping chunk_embeddings; vector search will be disabled until the extension loads');
-    }
-
     db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (5, ${Date.now()})`);
     console.log('[Migrations] RAG schema applied');
   },
@@ -174,7 +163,6 @@ const migration_v5: Migration = {
     db.exec('DROP TRIGGER IF EXISTS chunks_fts_delete');
     db.exec('DROP TRIGGER IF EXISTS chunks_fts_insert');
     db.exec('DROP TABLE IF EXISTS chunks_fts');
-    db.exec('DROP TABLE IF EXISTS chunk_embeddings');
     db.exec('DROP INDEX IF EXISTS idx_chunks_guide_id');
     db.exec('DROP TABLE IF EXISTS chunks');
     db.exec('DROP INDEX IF EXISTS idx_guides_indexed_at');
@@ -206,8 +194,102 @@ const migration_v6: Migration = {
   },
 };
 
+// Migration v7: Relabel guide titles to use the linked game's name (composed
+// with metadata.author when present). The content-extraction heuristic was
+// returning ASCII-art banners and stray byline lines as titles for the bulk
+// of the archive — see backfill numbers (88% no-overlap with games.title).
+// This relabel is idempotent: rows that already have metadata.original_title
+// are skipped, so re-runs are safe.
+const migration_v7: Migration = {
+  version: 7,
+  up: (db: Database.Database) => {
+    console.log('[Migrations] Relabeling guide titles to prefer games.title (this may take a minute)...');
+
+    const before = db.prepare(`
+      SELECT COUNT(*) AS n FROM guides g
+      JOIN games gm ON g.game_id = gm.id
+      WHERE TRIM(gm.title) != ''
+        AND json_extract(g.metadata, '$.original_title') IS NULL
+    `).get() as { n: number };
+    console.log(`[Migrations] v7: ${before.n} guides eligible for relabel`);
+
+    const txn = db.transaction(() => {
+      // Single UPDATE: stash old title in metadata.original_title AND set the
+      // new title in one shot, so the guides_fts_meta_update trigger fires
+      // exactly once per row instead of twice.
+      // The author filter must stay in sync with isLikelyAuthor() in
+      // GuideImporter.ts: length 2..60, no newlines / | / = / >, and ≤ 5
+      // spaces (the parser sometimes grabs whole sentences).
+      db.exec(`
+        UPDATE guides AS g
+        SET
+          metadata = json_set(COALESCE(g.metadata, '{}'), '$.original_title', g.title),
+          title = CASE
+            WHEN json_extract(g.metadata, '$.author') IS NOT NULL
+              AND LENGTH(TRIM(json_extract(g.metadata, '$.author'))) BETWEEN 2 AND 60
+              AND instr(json_extract(g.metadata, '$.author'), char(10)) = 0
+              AND instr(json_extract(g.metadata, '$.author'), '|') = 0
+              AND instr(json_extract(g.metadata, '$.author'), '=') = 0
+              AND instr(json_extract(g.metadata, '$.author'), '>') = 0
+              AND (LENGTH(TRIM(json_extract(g.metadata, '$.author')))
+                   - LENGTH(REPLACE(TRIM(json_extract(g.metadata, '$.author')), ' ', ''))) <= 5
+            THEN gm.title || ' — ' || TRIM(json_extract(g.metadata, '$.author'))
+            ELSE gm.title
+          END
+        FROM games gm
+        WHERE g.game_id = gm.id
+          AND TRIM(gm.title) != ''
+          AND json_extract(g.metadata, '$.original_title') IS NULL
+      `);
+      db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (7, ${Date.now()})`);
+    });
+    txn();
+
+    console.log('[Migrations] v7 applied');
+  },
+  down: (db: Database.Database) => {
+    // Restore each guide's original title from metadata.original_title where present.
+    console.log('[Migrations] Reverting v7: restoring original titles from metadata...');
+    db.exec(`
+      UPDATE guides
+      SET
+        title = json_extract(metadata, '$.original_title'),
+        metadata = json_remove(metadata, '$.original_title')
+      WHERE json_extract(metadata, '$.original_title') IS NOT NULL
+    `);
+    db.exec('DELETE FROM schema_version WHERE version = 7');
+  },
+};
+
+// Migration v8: vocab views over chunks_fts and guides_fts_meta. fts5vocab is
+// a read-only virtual table that exposes (term, doc, col) over an FTS5 index;
+// `?,row` mode gives per-term distinct-document counts in O(log n) — much
+// faster than `SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?`,
+// which is itself a full FTS5 search.
+//
+// Used by RetrievalService.filterToRareChunkTokens to drop common tokens
+// before BM25 scoring. Chunk-FTS was the dominant retrieval latency
+// contributor (94% of total wall time, p95 ~3.9s) before this filter; the
+// rare-token cutoff brings it in line with the title-FTS source which
+// already uses this trick.
+const migration_v8: Migration = {
+  version: 8,
+  up: (db: Database.Database) => {
+    console.log('[Migrations] Creating fts5vocab virtual tables for rare-token filtering...');
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_vocab USING fts5vocab(chunks_fts, row)`);
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS guides_fts_meta_vocab USING fts5vocab(guides_fts_meta, row)`);
+    db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (8, ${Date.now()})`);
+    console.log('[Migrations] v8 applied');
+  },
+  down: (db: Database.Database) => {
+    db.exec('DROP TABLE IF EXISTS chunks_fts_vocab');
+    db.exec('DROP TABLE IF EXISTS guides_fts_meta_vocab');
+    db.exec('DELETE FROM schema_version WHERE version = 8');
+  },
+};
+
 // All migrations in order
-export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5, migration_v6];
+export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5, migration_v6, migration_v7, migration_v8];
 
 // Get current schema version from database
 export function getCurrentVersion(db: Database.Database): number {
@@ -223,10 +305,7 @@ export function getCurrentVersion(db: Database.Database): number {
 }
 
 // Run all pending migrations
-export function runMigrations(
-  db: Database.Database,
-  ctx: MigrationContext = { vectorSearchAvailable: false }
-): void {
+export function runMigrations(db: Database.Database): void {
   const currentVersion = getCurrentVersion(db);
 
   console.log(`[Migrations] Current database version: ${currentVersion}`);
@@ -251,7 +330,7 @@ export function runMigrations(
   pendingMigrations.forEach(migration => {
     console.log(`[Migrations] Applying migration v${migration.version}...`);
     try {
-      migration.up(db, ctx);
+      migration.up(db);
       console.log(`[Migrations] Migration v${migration.version} applied successfully`);
     } catch (error) {
       console.error(`[Migrations] Failed to apply migration v${migration.version}:`, error);
@@ -267,11 +346,7 @@ export function runMigrations(
  * SECURITY: Never expose this function to user input (e.g. HTTP request).
  * It uses string interpolation for targetVersion; if called with untrusted input, SQL injection is possible.
  */
-export function rollbackTo(
-  db: Database.Database,
-  targetVersion: number,
-  ctx: MigrationContext = { vectorSearchAvailable: false }
-): void {
+export function rollbackTo(db: Database.Database, targetVersion: number): void {
   const currentVersion = getCurrentVersion(db);
 
   if (targetVersion >= currentVersion) {
@@ -290,7 +365,7 @@ export function rollbackTo(
       throw new Error(`Migration v${migration.version} does not have a rollback function`);
     }
     console.log(`[Migrations] Rolling back migration v${migration.version}...`);
-    migration.down(db, ctx);
+    migration.down(db);
   });
 
   // Update version

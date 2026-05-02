@@ -32,6 +32,10 @@ Thumbs.db
 # Claude Code local settings
 .claude/
 
-# Coverage 
+# Coverage
 
 **/coverage/
+
+# ANN bake-off scratch (large binary dumps + candidate indexes; see TODO.md)
+/scratch/
+*.usearch

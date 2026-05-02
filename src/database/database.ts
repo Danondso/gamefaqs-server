@@ -5,10 +5,11 @@ import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH } from './schema';
 import { runMigrations } from './migrations';
 import type { IDatabase } from '../interfaces/IDatabase';
 import { config } from '../config';
+import { AnnIndex } from '../services/AnnIndex';
 
 export class DatabaseService implements IDatabase {
   private db: Database.Database | null = null;
-  vectorSearchAvailable = false;
+  annIndex: AnnIndex | null = null;
 
   initialize(dbPath: string): void {
     // Ensure directory exists
@@ -39,14 +40,34 @@ export class DatabaseService implements IDatabase {
     this.db.pragma('mmap_size = 2147483648');    // 2 GiB ceiling
     this.db.pragma('temp_store = MEMORY');
 
-    // Best-effort load of sqlite-vec for vector search (must run before migrations
-    // so v5 can decide whether to create the chunk_embeddings vec0 virtual table)
-    this.loadVectorExtension();
-
     // Apply schema
     this.applySchema();
 
+    // Open the ANN index. Loads from `${dbPath}.ann` if it exists, otherwise
+    // starts empty and grows as the indexer adds chunks. Vectors live in
+    // this file, not in SQLite — there is no v2-table fallback.
+    this.openAnnIndex(dbPath);
+
     console.log('[Database] Initialized successfully');
+  }
+
+  private openAnnIndex(dbPath: string): void {
+    if (!this.db) return;
+    const file = config.annIndexPath || `${dbPath}.ann`;
+    const ann = new AnnIndex({
+      dim: config.embeddingDim,
+      file,
+      M: config.annM,
+      efAdd: config.annEfAdd,
+      efSearch: config.annEfSearch,
+    });
+
+    if (ann.load()) {
+      console.log(`[Database] ANN index loaded from ${file} (size=${ann.size().toLocaleString()})`);
+    } else {
+      console.log(`[Database] ANN index file missing at ${file}; starting empty (indexer will populate)`);
+    }
+    this.annIndex = ann;
   }
 
   initializeInMemory(): void {
@@ -58,10 +79,18 @@ export class DatabaseService implements IDatabase {
     // Enable foreign keys
     this.db.pragma('foreign_keys = ON');
 
-    this.loadVectorExtension();
-
     // Apply schema
     this.applySchema();
+
+    // In-memory databases get an empty in-memory ANN index. Tests that need
+    // vector search add vectors via annIndex.add(); no file IO.
+    this.annIndex = new AnnIndex({
+      dim: config.embeddingDim,
+      file: '/dev/null', // never saved for in-memory
+      M: config.annM,
+      efAdd: config.annEfAdd,
+      efSearch: config.annEfSearch,
+    });
 
     // In-memory databases don't log by default in tests
     if (process.env.NODE_ENV !== 'test') {
@@ -69,33 +98,11 @@ export class DatabaseService implements IDatabase {
     }
   }
 
-  private loadVectorExtension(): void {
-    if (!this.db) return;
-    if (!config.vectorSearchEnabled) {
-      this.vectorSearchAvailable = false;
-      return;
-    }
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const sqliteVec = require('sqlite-vec');
-      sqliteVec.load(this.db);
-      this.vectorSearchAvailable = true;
-      if (process.env.NODE_ENV !== 'test') {
-        console.log('[Database] sqlite-vec extension loaded');
-      }
-    } catch (err: any) {
-      this.vectorSearchAvailable = false;
-      if (process.env.NODE_ENV !== 'test') {
-        console.warn('[Database] sqlite-vec failed to load, vector search disabled:', err.message);
-      }
-    }
-  }
-
   private applySchema(): void {
     if (!this.db) throw new Error('Database not initialized');
 
     // Run migrations (handles both new and existing databases)
-    runMigrations(this.db, { vectorSearchAvailable: this.vectorSearchAvailable });
+    runMigrations(this.db);
 
     if (process.env.NODE_ENV !== 'test') {
       console.log('[Database] Schema applied');
@@ -123,6 +130,16 @@ export class DatabaseService implements IDatabase {
   }
 
   close(): void {
+    if (this.annIndex) {
+      try {
+        if (this.annIndex.saveIfDirty()) {
+          if (process.env.NODE_ENV !== 'test') console.log('[Database] ANN index saved on close');
+        }
+      } catch (err: any) {
+        console.error('[Database] ANN save on close failed:', err.message);
+      }
+      this.annIndex = null;
+    }
     if (this.db) {
       this.db.close();
       this.db = null;

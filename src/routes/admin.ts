@@ -591,7 +591,7 @@ router.post('/ai/index/start', async (req: Request, res: Response, next: NextFun
       message: 'Indexing starting...',
       embeddingHost: embeddingService.getHost(),
       embeddingModel: embeddingService.getModel(),
-      vectorSearchAvailable: Database.vectorSearchAvailable,
+      annIndexSize: Database.annIndex?.size() ?? 0,
     });
 
     console.log(`[Admin] Starting indexing (limit=${limit ?? 'none'}, force=${force})`);
@@ -620,7 +620,7 @@ router.get('/ai/index/status', (req: Request, res: Response) => {
     db: indexingService.getDbStats(),
     embeddingHost: embeddingService.getHost(),
     embeddingModel: embeddingService.getModel(),
-    vectorSearchAvailable: Database.vectorSearchAvailable,
+    annIndexSize: Database.annIndex?.size() ?? 0,
   });
 });
 
@@ -1875,7 +1875,7 @@ router.get('/panel', (req: Request, res: Response) => {
         const data = await response.json();
         if (response.ok) {
           indexMetaText = (data.embeddingHost || '') + ' / ' + (data.embeddingModel || '') +
-            (data.vectorSearchAvailable === false ? ' (vector search unavailable — FTS only)' : '');
+            (data.annIndexSize ? ' (ANN: ' + Number(data.annIndexSize).toLocaleString() + ' vectors)' : '');
           document.getElementById('indexMeta').textContent = indexMetaText;
           statusText.textContent = 'Connecting...';
           connectIndexSSE();
@@ -1924,7 +1924,7 @@ router.get('/panel', (req: Request, res: Response) => {
         .then(data => {
           if (data.embeddingHost) {
             indexMetaText = data.embeddingHost + ' / ' + data.embeddingModel +
-              (data.vectorSearchAvailable === false ? ' (vector search unavailable — FTS only)' : '');
+              (data.annIndexSize ? ' (ANN: ' + Number(data.annIndexSize).toLocaleString() + ' vectors)' : '');
           }
           if (data.db) indexDbStats = data.db;
           if (data.progress) {

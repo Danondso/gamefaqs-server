@@ -46,7 +46,18 @@ export const config = {
   // content stays under 2048 after chunking + overlap.
   chunkSizeTokens: parseInt(process.env.CHUNK_SIZE_TOKENS || '400', 10),
   chunkOverlapTokens: parseInt(process.env.CHUNK_OVERLAP_TOKENS || '50', 10),
-  vectorSearchEnabled: process.env.VECTOR_SEARCH_ENABLED !== 'false',
+  // ANN (USearch HNSW i8). Default file lives next to the SQLite db so a
+  // single mount covers both. Knobs match the bake-off run that picked
+  // USearch i8 (recall@8 87% end-to-end vs the brute-force baseline,
+  // p95 vec latency 7ms).
+  annIndexPath: process.env.ANN_INDEX_PATH, // defaults to `${dbPath}.ann` if unset
+  annM: parseInt(process.env.ANN_M || '16', 10),
+  annEfAdd: parseInt(process.env.ANN_EF_ADD || '200', 10),
+  annEfSearch: parseInt(process.env.ANN_EF_SEARCH || '256', 10),
+  // Periodic save cadence for the ANN index during ingest. Saving the full
+  // file is ~2s for a 3 GB index; saving every 100 indexed guides keeps
+  // crash-recovery loss bounded to ~100 guides without pegging IO.
+  annSaveEveryGuides: parseInt(process.env.ANN_SAVE_EVERY_GUIDES || '100', 10),
   ragTopK: parseInt(process.env.RAG_TOP_K || '8', 10),
   answerRateLimitPerMin: parseInt(process.env.ANSWER_RATE_LIMIT || '10', 10),
 
