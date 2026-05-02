@@ -88,7 +88,11 @@ When the server starts for the first time with an empty database:
 
 **Total time:** 20-40 minutes depending on system performance
 
-**Subsequent startups:** Instant (<5 seconds) - database persists
+**Subsequent startups:** Instant (<5 seconds) - database persists. Migrations run automatically; upgrading an existing DB to schema v7 will relabel guide titles in-place to `Game Name` or `Game Name — Author` (the previous content-extracted titles often picked up ASCII banners or bylines). The original parsed title is preserved on each row under `metadata.original_title`.
+
+### Guide title format
+
+Guide titles returned by the API are derived from the linked game's name rather than the guide file's content, so titles in `/api/guides/*` responses look like `Final Fantasy VII` or `Final Fantasy VII — SomeAuthor`. This also makes the `/api/guides/answer` retriever more reliable for game-named questions: a title-aware BM25 source is fused with vector + content FTS, so chunks from the right guide get boosted even when the chunk text doesn't repeat the game's name.
 
 ## API Documentation
 

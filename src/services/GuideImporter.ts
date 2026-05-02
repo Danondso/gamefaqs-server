@@ -8,6 +8,40 @@ import type { Guide, ImportProgress, ImportProgressCallback } from '../types';
 
 const BATCH_SIZE = 100;
 
+/**
+ * Build the canonical guide title: `${gameName}` or `${gameName} — ${author}`.
+ * Falls back to the parsed title when no clean game name is available. The
+ * author check filters obvious junk (the upstream regex sometimes grabs whole
+ * sentences) — must stay in sync with the SQL CASE in migration v7.
+ */
+export function composeGuideTitle(
+  gameName: string | undefined,
+  fallback: string,
+  author: string | undefined
+): string {
+  const game = gameName?.trim();
+  if (!game || game.toLowerCase() === 'unknown game') return fallback;
+  const cleaned = cleanAuthor(author);
+  if (!cleaned) return game;
+  return `${game} — ${cleaned}`;
+}
+
+function cleanAuthor(author: string | undefined): string | null {
+  if (!author) return null;
+  // Strip trailing runs of separator chars (the parser regex sometimes pulls in
+  // ASCII-banner dashes/asterisks/equals after the actual author name).
+  const a = author
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[\s\-*=_~.]{2,}$/, '')
+    .trim();
+  if (a.length < 2 || a.length > 60) return null;
+  if (/[|=>]/.test(a)) return null;
+  // ≤ 5 spaces ≈ ≤ 6 words — sentences slip past the regex extractor.
+  if ((a.match(/ /g)?.length ?? 0) > 5) return null;
+  return a;
+}
+
 class GuideImporter {
   private isImporting = false;
   /** Cache game external_id -> db id to avoid repeated DB lookups during import */
@@ -160,10 +194,18 @@ class GuideImporter {
       ...parsed.metadata,
       tags,
       platform: platform || parsed.metadata.platform,
+      original_title: parsed.title,
     };
 
+    // Prefer the linked game's name as the guide title — the content-extraction
+    // heuristic frequently picks up ASCII-art banners or stray bylines. Compose
+    // with author when present so multiple guides for the same game stay
+    // distinguishable in citations. The original parsed title lives on in
+    // metadata.original_title for later cleanup passes.
+    const title = composeGuideTitle(gameName, parsed.title, parsed.metadata.author);
+
     return GuideModel.create({
-      title: parsed.title,
+      title,
       content: parsed.content,
       format: parsed.format,
       file_path: filePath,

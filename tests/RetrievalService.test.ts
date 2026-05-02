@@ -5,6 +5,7 @@ import {
   RetrievalService,
   sanitizeFtsQuery,
   type FtsHit,
+  type TitleHit,
   type VectorHit,
 } from '../src/services/RetrievalService';
 import type { EmbeddingService } from '../src/services/EmbeddingService';
@@ -122,6 +123,113 @@ describe('RetrievalService', () => {
     for (let i = 1; i < citations.length; i++) {
       expect(citations[i - 1].score).toBeGreaterThanOrEqual(citations[i].score);
     }
+  });
+
+  it('filters common tokens out of the title-FTS query so rare game names dominate', async () => {
+    // Seed enough guides that "best" / "class" exceed the 5% rarity threshold
+    // while "diablo" stays well below it. Threshold = max(50, total*0.05) so we
+    // need >50 "best" titles. We add many fluff guides so total is large.
+    const guides: SeededGuide[] = [];
+    const chunks: SeededChunk[] = [];
+
+    // 60 fluff guides whose titles contain "best" — common token.
+    for (let i = 0; i < 60; i++) {
+      guides.push({ id: `fluff-${i}`, title: `Best of the Best Karate ${i}` });
+      chunks.push({ id: `cf-${i}`, guide_id: `fluff-${i}`, index: 0, content: 'fluff content' });
+    }
+    // 60 fluff guides whose titles contain "class".
+    for (let i = 0; i < 60; i++) {
+      guides.push({ id: `cls-${i}`, title: `Class of Heroes ${i}` });
+      chunks.push({ id: `cc-${i}`, guide_id: `cls-${i}`, index: 0, content: 'fluff content' });
+    }
+    // Two Diablo guides — rare token. We want chunks of THESE to win.
+    guides.push({ id: 'd2-1', title: 'Diablo II — Patrick Martin' });
+    chunks.push({ id: 'cd-1', guide_id: 'd2-1', index: 0, content: 'mechanics' });
+    guides.push({ id: 'd2-2', title: 'Diablo II Lord of Destruction' });
+    chunks.push({ id: 'cd-2', guide_id: 'd2-2', index: 0, content: 'mechanics' });
+
+    // Pad total to make the 5% threshold meaningful (~ over 1000 guides).
+    for (let i = 0; i < 1000; i++) {
+      guides.push({ id: `pad-${i}`, title: `Padding Game ${i}` });
+      chunks.push({ id: `cp-${i}`, guide_id: `pad-${i}`, index: 0, content: 'pad' });
+    }
+
+    seed(db, guides, chunks);
+
+    // Capture the actual title query that gets passed in. We expect "diablo"
+    // to be there; "best" and "class" should be dropped because they exceed
+    // the rarity threshold.
+    let observedTitleQuery: string | null = null;
+    const titleSearch = (q: string): TitleHit[] => {
+      observedTitleQuery = q;
+      // Real FTS5 isn't running here — just return the Diablo guides if the
+      // query contains "diablo".
+      if (q.toLowerCase().includes('diablo')) {
+        return [
+          { guide_id: 'd2-1', rank: 0 },
+          { guide_id: 'd2-2', rank: 1 },
+        ];
+      }
+      return [];
+    };
+
+    const svc = new RetrievalService({
+      db,
+      embeddingService: mockEmbedder,
+      vectorSearch: () => [],
+      ftsSearch: () => [],
+      titleSearch,
+      rrfK: 60,
+    });
+
+    const citations = await svc.retrieve("what's the best class in diablo", {}, 5);
+    expect(observedTitleQuery).not.toBeNull();
+    expect(observedTitleQuery!.toLowerCase()).toContain('diablo');
+    expect(observedTitleQuery!.toLowerCase()).not.toContain('best');
+    expect(observedTitleQuery!.toLowerCase()).not.toContain('class');
+    // Only Diablo chunks should surface (vec/FTS returned nothing).
+    const ids = new Set(citations.map(c => c.chunk_id));
+    expect(ids).toEqual(new Set(['cd-1', 'cd-2']));
+  });
+
+  it('boosts chunks of title-matched guides via the title source', async () => {
+    // Two guides; chunk content is identical (so vec/FTS rank them equally),
+    // but only "Diablo II" matches the title-FTS query. Without the title
+    // source, c-D and c-X would tie. With it, c-D should outrank c-X.
+    const gD: SeededGuide = { id: 'g-d2', title: 'Diablo II — Patrick Martin' };
+    const gX: SeededGuide = { id: 'g-cod', title: 'Call of Duty Modern Warfare 3' };
+    const chunks: SeededChunk[] = [
+      { id: 'c-D', guide_id: gD.id, index: 0, content: 'mechanics talk '.repeat(50) },
+      { id: 'c-X', guide_id: gX.id, index: 0, content: 'mechanics talk '.repeat(50) },
+    ];
+    seed(db, [gD, gX], chunks);
+
+    // Vec + FTS rank them identically.
+    const vectorSearch = (): VectorHit[] => [
+      { chunk_id: 'c-D', distance: 0.1 },
+      { chunk_id: 'c-X', distance: 0.1 },
+    ];
+    const ftsSearch = (): FtsHit[] => [
+      { chunk_id: 'c-D', rank: -0.5 },
+      { chunk_id: 'c-X', rank: -0.5 },
+    ];
+    // Title-FTS surfaces only the Diablo II guide.
+    const titleSearch = (): TitleHit[] => [{ guide_id: gD.id, rank: 0 }];
+
+    const svc = new RetrievalService({
+      db,
+      embeddingService: mockEmbedder,
+      vectorSearch,
+      ftsSearch,
+      titleSearch,
+      rrfK: 60,
+    });
+
+    const citations = await svc.retrieve('best class in diablo', {}, 2);
+    expect(citations[0].chunk_id).toBe('c-D');
+    expect(citations[0].guide_id).toBe(gD.id);
+    // c-X has only vec+FTS contributions; c-D has vec+FTS+title.
+    expect(citations[0].score).toBeGreaterThan(citations[1].score);
   });
 
   it('truncates excerpts to ~300 chars', async () => {
