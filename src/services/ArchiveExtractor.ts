@@ -3,6 +3,7 @@ import * as path from 'path';
 import yauzl, { ZipFile, Entry } from 'yauzl';
 import Seven from 'node-7z';
 import type { ExtractionProgress, ExtractionProgressCallback } from '../types';
+import { buildDedupePlan } from './DedupePlanner';
 
 class ArchiveExtractor {
   private progress: ExtractionProgress = {
@@ -46,6 +47,17 @@ class ArchiveExtractor {
         currentArchive: 0,
       });
 
+      // Stage 1.5: Plan dedup across all archives before any extraction.
+      // GameFAQs cross-lists the same guide under multiple game directories
+      // (often spanning gens), so the plan must be global. Survivors are
+      // chosen by size DESC → gen ASC → path lex ASC.
+      console.log('[Extraction] Stage 1.5: Planning dedup across archives');
+      const plan = await buildDedupePlan(sevenZipArchives);
+      console.log(
+        `[Dedupe] keep ${plan.stats.uniqueGuides} unique + ${plan.stats.passthrough} passthrough, ` +
+          `drop ${plan.stats.dropped} (${(plan.stats.bytesDropped / 1e9).toFixed(2)} GB redundant)`
+      );
+
       // Stage 2: Extract nested 7z archives
       console.log('[Extraction] Stage 2: Extracting nested 7z archives');
       for (let i = 0; i < sevenZipArchives.length; i++) {
@@ -61,13 +73,20 @@ class ArchiveExtractor {
         // Per-archive progress is already surfaced via updateProgress → InitService's
         // throttled [Init] log; no per-archive console line needed here.
 
-        try {
-          await this.extract7zArchive(sevenZipPath, outputDir);
-        } catch (error) {
-          console.error('[Extraction] Error extracting 7z archive:', archiveName, error);
-          this.updateProgress({
-            error: `Failed to extract ${archiveName}: ${error}`,
-          });
+        const include = plan.cherryPicks.get(sevenZipPath) ?? [];
+        if (include.length === 0) {
+          // An empty listfile would silently make 7z exit with an error; an
+          // unset $cherryPick would extract everything. Bail explicitly.
+          console.warn(`[Dedupe] No survivors for ${archiveName} — skipping extract`);
+        } else {
+          try {
+            await this.extract7zArchive(sevenZipPath, outputDir, include);
+          } catch (error) {
+            console.error('[Extraction] Error extracting 7z archive:', archiveName, error);
+            this.updateProgress({
+              error: `Failed to extract ${archiveName}: ${error}`,
+            });
+          }
         }
 
         // Delete the 7z archive after extraction to save space
@@ -182,24 +201,34 @@ class ArchiveExtractor {
   }
 
   /**
-   * Extract 7z archive using node-7z
+   * Extract a 7z archive, restricted to the supplied internal paths.
+   *
+   * Paths are passed via `-i@listfile` (written to a temp file) rather than
+   * `$cherryPick`. The listfile sidesteps ARG_MAX (a worst-case archive could
+   * push tens of thousands of paths through argv) and turns an empty include
+   * into a loud 7z error rather than `$cherryPick`'s silent extract-all.
    */
-  private extract7zArchive(sevenZipPath: string, outputDir: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      // Per-archive start/end + per-100-file ticks would emit thousands of
-      // lines across the full import; the InitService [Init] log is throttled
-      // and surfaces per-archive progress via updateProgress below.
+  private extract7zArchive(
+    sevenZipPath: string,
+    outputDir: string,
+    includePaths: string[]
+  ): Promise<void> {
+    const listfilePath = path.join(
+      outputDir,
+      `.cherrypick-${path.basename(sevenZipPath)}.txt`
+    );
+    fs.writeFileSync(listfilePath, includePaths.join('\n') + '\n');
 
+    return new Promise((resolve, reject) => {
       const extractStream = Seven.extractFull(sevenZipPath, outputDir, {
         $progress: true,
         recursive: true,
+        $raw: [`-i@${listfilePath}`],
       });
 
-      let extractedCount = 0;
-
-      extractStream.on('data', () => {
-        extractedCount++;
-      });
+      const cleanup = () => {
+        try { fs.unlinkSync(listfilePath); } catch { /* best-effort */ }
+      };
 
       extractStream.on('progress', (progress: { percent?: number }) => {
         this.updateProgress({
@@ -208,10 +237,12 @@ class ArchiveExtractor {
       });
 
       extractStream.on('end', () => {
+        cleanup();
         resolve();
       });
 
       extractStream.on('error', (err: Error) => {
+        cleanup();
         console.error('[7z] Extraction error:', err);
         reject(err);
       });

@@ -137,7 +137,7 @@ class InitService {
       // Stage 3: Import guides (40% of progress, offset 60)
       this.updateStatus('importing', 60, 'Importing guides to database...');
 
-      const result = await GuideImporter.importFromDirectory(
+      await GuideImporter.importFromDirectory(
         extractedDir,
         (progress) => {
           const percentage = 60 + Math.floor((progress.current / Math.max(progress.total, 1)) * 40);
@@ -146,11 +146,6 @@ class InitService {
           );
         }
       );
-
-      console.log('[Init] Import complete!');
-      console.log(`[Init]   Imported: ${result.imported.toLocaleString()} guides`);
-      console.log(`[Init]   Errors: ${result.errors}`);
-      console.log(`[Init]   Skipped: ${result.skipped}`);
 
       // Cleanup extracted files
       console.log('[Init] Cleaning up temporary files...');
