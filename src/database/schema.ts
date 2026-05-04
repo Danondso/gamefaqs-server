@@ -1,7 +1,7 @@
 // SQLite database schema definitions
 // Ported from gamefaqs-reader mobile app
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 export const CREATE_TABLES = {
   guides: `
@@ -103,6 +103,22 @@ export const CREATE_TABLES = {
       platform TEXT PRIMARY KEY
     );
   `,
+
+  // Chunks of guide content for retrieval-augmented generation
+  chunks: `
+    CREATE TABLE IF NOT EXISTS chunks (
+      id           TEXT PRIMARY KEY,
+      guide_id     TEXT NOT NULL,
+      chunk_index  INTEGER NOT NULL,
+      content      TEXT NOT NULL,
+      char_start   INTEGER NOT NULL,
+      char_end     INTEGER NOT NULL,
+      token_count  INTEGER NOT NULL,
+      created_at   INTEGER NOT NULL,
+      FOREIGN KEY (guide_id) REFERENCES guides(id) ON DELETE CASCADE,
+      UNIQUE(guide_id, chunk_index)
+    );
+  `,
 };
 
 export const CREATE_INDEXES = {
@@ -126,6 +142,77 @@ export const CREATE_INDEXES = {
     "CREATE INDEX IF NOT EXISTS idx_games_external_id ON games(json_extract(metadata, '$.external_id'));",
   // Index for fast tag lookups (for filtering by tag)
   guide_tags_tag: 'CREATE INDEX IF NOT EXISTS idx_guide_tags_tag ON guide_tags(tag);',
+  // RAG indexes
+  chunks_guide_id: 'CREATE INDEX IF NOT EXISTS idx_chunks_guide_id ON chunks(guide_id);',
+};
+
+// DDL for the RAG chunk-level search infrastructure. Vectors live in the ANN
+// file (see `AnnIndex`), not in SQLite. The chunks_fts table backs BM25
+// retrieval; chunks_fts_vocab (created in migration v5 alongside the FTS
+// table) supports rare-token filtering.
+// FTS5 over `games.title` for direct game-name lookup at retrieval time.
+// Used by RetrievalService.extractGameCandidates to convert "<aspect> in
+// <Game Name>" questions into the matching game_id, then to a guide-id set
+// that gets a strong RRF boost — sidestepping the rare-token-filter issue
+// where action verbs like "beat", "elite" outrank actual game-name tokens.
+//
+// Default tokenizer (porter unicode61) splits on whitespace + punctuation,
+// so a phrase query for `"final fantasy x"` will NOT match `Final Fantasy XI`
+// (token `x` ≠ token `xi`). That word-boundary behavior is the whole point
+// — it's what plain `LIKE '%final fantasy x%'` can't give us.
+export const GAMES_FTS_DDL = {
+  gamesFts: `
+    CREATE VIRTUAL TABLE IF NOT EXISTS games_fts USING fts5(
+      game_id UNINDEXED,
+      title,
+      tokenize = 'porter unicode61'
+    );
+  `,
+
+  gamesFtsInsert: `
+    CREATE TRIGGER IF NOT EXISTS games_fts_insert AFTER INSERT ON games
+    BEGIN
+      INSERT INTO games_fts(game_id, title) VALUES (new.id, new.title);
+    END;
+  `,
+
+  gamesFtsUpdate: `
+    CREATE TRIGGER IF NOT EXISTS games_fts_update AFTER UPDATE OF title ON games
+    BEGIN
+      UPDATE games_fts SET title = new.title WHERE game_id = new.id;
+    END;
+  `,
+
+  gamesFtsDelete: `
+    CREATE TRIGGER IF NOT EXISTS games_fts_delete AFTER DELETE ON games
+    BEGIN
+      DELETE FROM games_fts WHERE game_id = old.id;
+    END;
+  `,
+};
+
+export const RAG_DDL = {
+  chunksFts: `
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+      chunk_id UNINDEXED,
+      content,
+      tokenize = 'porter unicode61'
+    );
+  `,
+
+  chunksFtsInsert: `
+    CREATE TRIGGER IF NOT EXISTS chunks_fts_insert AFTER INSERT ON chunks
+    BEGIN
+      INSERT INTO chunks_fts(chunk_id, content) VALUES (new.id, new.content);
+    END;
+  `,
+
+  chunksFtsDelete: `
+    CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunks
+    BEGIN
+      DELETE FROM chunks_fts WHERE chunk_id = old.id;
+    END;
+  `,
 };
 
 // Split FTS architecture:

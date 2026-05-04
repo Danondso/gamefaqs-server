@@ -14,6 +14,9 @@ dist
 *.db-wal
 *.db-shm
 
+# Cached archive (12+ GB — host bind mount target from docker-compose.yml)
+/archive/
+
 # Logs
 npm-debug.log
 *.log
@@ -29,6 +32,10 @@ Thumbs.db
 # Claude Code local settings
 .claude/
 
-# Coverage 
+# Coverage
 
 **/coverage/
+
+# Scratch and one-off experiment outputs (large binary dumps, side indexes)
+/scratch/
+*.usearch

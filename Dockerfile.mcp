@@ -1,0 +1,40 @@
+# GameFAQs MCP Server — bundled JS + distroless runtime.
+# Final image carries: node runtime, one bundled mcp-server.js, and
+# better-sqlite3 (the only dep that can't be bundled — it's a native module).
+#
+# Modes selected at runtime:
+#   Remote:  docker run --rm -i -e GAMEFAQS_API_URL=http://host:3000 gamefaqs-mcp
+#   Local:   docker run --rm -i -v gamefaqs-data:/data/db gamefaqs-mcp
+
+# --- Stage 1: bundle TS + JS deps into a single file -----------------------
+FROM node:20-bookworm-slim AS builder
+WORKDIR /app
+COPY package*.json tsconfig.json ./
+RUN npm ci --no-audit --no-fund
+COPY src ./src
+RUN npm run mcp:bundle
+
+# --- Stage 2: install only the native dep (better-sqlite3) -----------------
+# Pin sourced from the workspace package.json so a version bump there flows
+# through automatically — no second hand-edited literal to drift.
+FROM node:20-bookworm-slim AS deps
+WORKDIR /app
+COPY package.json ./package.json.full
+RUN node -e "const p=require('./package.json.full');require('fs').writeFileSync('./package.json',JSON.stringify({name:'gamefaqs-mcp-deps',version:'0.0.0',private:true,dependencies:{'better-sqlite3':p.dependencies['better-sqlite3']}}))" \
+ && rm package.json.full \
+ && npm install --omit=dev --no-audit --no-fund --no-package-lock \
+ && rm -rf /root/.npm package.json \
+ # Strip source-build artifacts; we only need the prebuilt .node binary + JS wrapper
+ && cd node_modules/better-sqlite3 \
+ && rm -rf deps src binding.gyp README.md LICENSE docs \
+ && find build -type f ! -name '*.node' -delete \
+ && find build -type d -empty -delete
+
+# --- Stage 3: distroless runtime -------------------------------------------
+FROM gcr.io/distroless/nodejs20-debian12
+WORKDIR /app
+COPY --from=builder /app/dist/mcp-server.js ./mcp-server.js
+COPY --from=deps    /app/node_modules        ./node_modules
+ENV NODE_ENV=production
+ENV DB_PATH=/data/db/gamefaqs.db
+CMD ["mcp-server.js"]

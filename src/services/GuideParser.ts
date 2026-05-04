@@ -2,6 +2,28 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { GuideMetadata, ParsedGuide } from '../types';
 
+const LOWERCASE_PARTICLES = new Set(['of', 'the', 'and', 'a', 'an', 'in', 'on', 'at', 'to', 'for']);
+// "I" alone is ambiguous (pronoun, "Episode I", etc.), so only II..XX are uppercased.
+const ROMAN_NUMERAL = /^(ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii|xiii|xiv|xv|xvi|xvii|xviii|xix|xx)$/i;
+
+/**
+ * Title-case a game name extracted from a filename slug. Lowercase particles
+ * stay lowercase mid-title (but capitalize at index 0), and roman numerals
+ * II..XX are uppercased so "Final Fantasy Vii" comes out "Final Fantasy VII".
+ */
+export function titleCaseGameName(input: string): string {
+  return input
+    .split(' ')
+    .filter(w => w.length > 0)
+    .map((word, index) => {
+      const lower = word.toLowerCase();
+      if (ROMAN_NUMERAL.test(lower)) return lower.toUpperCase();
+      if (index > 0 && LOWERCASE_PARTICLES.has(lower)) return lower;
+      return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+    })
+    .join(' ');
+}
+
 class GuideParser {
   /** Max chars to scan for metadata/tags (avoids scanning huge guides) */
   private static readonly METADATA_SCAN_LENGTH = 8000;
@@ -220,22 +242,7 @@ class GuideParser {
     cleaned = cleaned.replace(/[_-]/g, ' ');
     cleaned = cleaned.replace(/\s+/g, ' ').trim();
 
-    return cleaned
-      .split(' ')
-      .map(word => {
-        const lowerWord = word.toLowerCase();
-        if (['of', 'the', 'and', 'a', 'an', 'in', 'on', 'at', 'to', 'for'].includes(lowerWord)) {
-          return lowerWord;
-        }
-        return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
-      })
-      .map((word, index) => {
-        if (index === 0) {
-          return word.charAt(0).toUpperCase() + word.slice(1);
-        }
-        return word;
-      })
-      .join(' ');
+    return titleCaseGameName(cleaned);
   }
 
   /**
@@ -422,11 +429,7 @@ class GuideParser {
       if (gameFolderMatch) {
         const gameId = gameFolderMatch[1];
         const gameNameSlug = gameFolderMatch[2];
-
-        const gameName = gameNameSlug
-          .split('-')
-          .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-          .join(' ');
+        const gameName = titleCaseGameName(gameNameSlug.replace(/-/g, ' '));
 
         return { gameId, gameName, platform };
       }

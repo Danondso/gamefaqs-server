@@ -3,6 +3,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import InitService from '../services/InitService';
 import OllamaService from '../services/OllamaService';
+import { EmbeddingService } from '../services/EmbeddingService';
+import { IndexingService } from '../services/IndexingService';
 import GuideModel from '../models/Guide';
 import GameModel from '../models/Game';
 import Database from '../database/database';
@@ -10,6 +12,15 @@ import { config } from '../config';
 import type { GuideMetadata, Guide } from '../types';
 
 const router = Router();
+
+// Shared singletons for the RAG indexer. Constructed once so admin endpoints
+// see consistent progress across requests.
+const embeddingService = new EmbeddingService({
+  host: config.embeddingHost,
+  model: config.embeddingModel,
+  dim: config.embeddingDim,
+});
+const indexingService = new IndexingService({ embeddingService });
 
 // Login page shown when ADMIN_TOKEN is set but request has no valid token
 const loginPageHtml = `
@@ -548,6 +559,100 @@ router.get('/ai/yolo/stream', (req: Request, res: Response) => {
   });
 });
 
+// ========== RAG Indexing Endpoints ==========
+
+// POST /api/admin/ai/index/start - Start background chunk + embedding indexer
+router.post('/ai/index/start', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (indexingService.isRunning()) {
+      res.status(409).json({ error: 'Indexing already in progress' });
+      return;
+    }
+
+    const limitParam = req.query.limit as string | undefined;
+    const force = req.query.force === 'true';
+    const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+    if (limitParam && (Number.isNaN(limit!) || limit! <= 0)) {
+      res.status(400).json({ error: 'limit must be a positive integer' });
+      return;
+    }
+
+    const availability = await embeddingService.checkAvailability();
+    if (!availability.available) {
+      res.status(503).json({
+        error: 'Embedding service unavailable',
+        details: availability.error,
+      });
+      return;
+    }
+
+    res.status(202).json({
+      success: true,
+      message: 'Indexing starting...',
+      embeddingHost: embeddingService.getHost(),
+      embeddingModel: embeddingService.getModel(),
+      annIndexSize: Database.annIndex?.size() ?? 0,
+    });
+
+    console.log(`[Admin] Starting indexing (limit=${limit ?? 'none'}, force=${force})`);
+    indexingService.start({ limit, force }).catch(err => {
+      console.error('[Admin] Indexing start failed:', err);
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// POST /api/admin/ai/index/stop - Request graceful stop
+router.post('/ai/index/stop', (req: Request, res: Response) => {
+  if (!indexingService.isRunning()) {
+    res.status(400).json({ error: 'Indexing not running' });
+    return;
+  }
+  indexingService.stop();
+  res.json({ success: true, message: 'Indexing stop requested' });
+});
+
+// GET /api/admin/ai/index/status - Snapshot of indexer state
+router.get('/ai/index/status', (req: Request, res: Response) => {
+  res.json({
+    progress: indexingService.getProgress(),
+    db: indexingService.getDbStats(),
+    embeddingHost: embeddingService.getHost(),
+    embeddingModel: embeddingService.getModel(),
+    annIndexSize: Database.annIndex?.size() ?? 0,
+  });
+});
+
+// GET /api/admin/ai/index/stream - SSE stream of indexer progress
+router.get('/ai/index/stream', (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Content-Encoding', 'none');
+  res.flushHeaders();
+
+  const sendProgress = (progress: any) => {
+    res.write(`data: ${JSON.stringify(progress)}\n\n`);
+    if (typeof (res as any).flush === 'function') {
+      (res as any).flush();
+    }
+  };
+
+  sendProgress(indexingService.getProgress());
+  const unsubscribe = indexingService.onProgressChange(sendProgress);
+
+  const keepalive = setInterval(() => {
+    res.write(`: keepalive\n\n`);
+  }, 5000);
+
+  req.on('close', () => {
+    clearInterval(keepalive);
+    unsubscribe();
+  });
+});
+
 // Serve admin panel HTML at /admin
 router.get('/panel', (req: Request, res: Response) => {
   const adminHtml = `
@@ -580,6 +685,10 @@ router.get('/panel', (req: Request, res: Response) => {
       padding: 24px;
       border: 1px solid #334155;
     }
+    /* Tighter bottom padding on the top stat cards (Total Guides, Total Games,
+       Database Size, Server Uptime) — they only contain a label/value/label
+       triplet and don't need the full 24px below. */
+    .grid > .card { padding-bottom: 12px; }
     .card-title {
       font-size: 0.875rem;
       text-transform: uppercase;
@@ -597,7 +706,13 @@ router.get('/panel', (req: Request, res: Response) => {
       color: #64748b;
       margin-top: 4px;
     }
-    .progress-section { margin-top: 30px; }
+    /* Uniform 20px gap between consecutive top-level panels — matches the
+       grid's gap. The grid's own margin-bottom handles the gap between the
+       stat cards and the first standalone card; this rule handles every
+       card-to-card transition after that. Scoped to .container's direct
+       children so grid items aren't pushed by sibling-margin selectors. */
+    .container > .card + .card { margin-top: 20px; }
+    .progress-section { margin-top: 0; }
     .progress-bar {
       width: 100%;
       height: 32px;
@@ -884,6 +999,47 @@ router.get('/panel', (req: Request, res: Response) => {
           </div>
         </div>
       </div>
+
+      <div style="margin-top: 24px; padding-top: 20px; border-top: 1px solid #334155;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <div>
+            <div style="font-weight: 600; color: #e2e8f0;">RAG Indexing</div>
+            <div style="font-size: 0.75rem; color: #64748b; margin-top: 4px;">Chunk and embed guide content for semantic search</div>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="ai-btn ai-btn-primary" id="indexStartBtn">Start Indexing</button>
+            <button class="ai-btn ai-btn-danger" id="indexStopBtn" style="display: none;">Stop</button>
+          </div>
+        </div>
+        <div id="indexStatus" style="display: none; padding: 16px; background: #0f172a; border-radius: 8px;">
+          <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 12px;">
+            <div class="index-spinner" style="width: 20px; height: 20px; border: 3px solid #334155; border-top-color: #3b82f6; border-radius: 50%; animation: spin 1s linear infinite;"></div>
+            <span id="indexStatusText" style="color: #e2e8f0; font-weight: 500;">Starting...</span>
+          </div>
+          <div class="ai-progress-bar" style="margin-bottom: 12px;">
+            <div class="ai-progress-fill" id="indexProgressBar" style="width: 0%;"></div>
+          </div>
+          <div id="indexStats" style="display: none; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 12px;">
+            <div style="text-align: center; padding: 12px; background: #1e293b; border-radius: 6px;">
+              <div style="font-size: 1.5rem; font-weight: 700; color: #fff;" id="indexProcessed">0</div>
+              <div style="font-size: 0.75rem; color: #94a3b8;">Processed</div>
+            </div>
+            <div style="text-align: center; padding: 12px; background: #1e293b; border-radius: 6px;">
+              <div style="font-size: 1.5rem; font-weight: 700; color: #10b981;" id="indexSucceeded">0</div>
+              <div style="font-size: 0.75rem; color: #94a3b8;">Succeeded</div>
+            </div>
+            <div style="text-align: center; padding: 12px; background: #1e293b; border-radius: 6px;">
+              <div style="font-size: 1.5rem; font-weight: 700; color: #ef4444;" id="indexFailed">0</div>
+              <div style="font-size: 0.75rem; color: #94a3b8;">Failed</div>
+            </div>
+            <div style="text-align: center; padding: 12px; background: #1e293b; border-radius: 6px;">
+              <div style="font-size: 1.5rem; font-weight: 700; color: #3b82f6;" id="indexChunks">0</div>
+              <div style="font-size: 0.75rem; color: #94a3b8;">Chunks</div>
+            </div>
+          </div>
+          <div id="indexMeta" style="font-size: 0.75rem; color: #64748b; margin-top: 12px;"></div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -968,9 +1124,14 @@ router.get('/panel', (req: Request, res: Response) => {
       document.getElementById('gameCount').textContent = initStatus.gameCount.toLocaleString();
     }
 
+    function formatSizeMB(mb) {
+      if (mb >= 1024) return (mb / 1024).toFixed(2) + ' GB';
+      return mb.toFixed(2) + ' MB';
+    }
+
     function updateFullStatus(data) {
       updateUI(data.init);
-      document.getElementById('dbSize').textContent = data.database.sizeMB + ' MB';
+      document.getElementById('dbSize').textContent = formatSizeMB(data.database.sizeMB);
 
       const uptimeHours = Math.floor(data.server.uptime / 3600);
       const uptimeMinutes = Math.floor((data.server.uptime % 3600) / 60);
@@ -1528,6 +1689,254 @@ router.get('/panel', (req: Request, res: Response) => {
         .catch(() => {});
     }
     checkYoloStatus();
+
+    // ========== RAG Indexing ==========
+    let indexEventSource = null;
+    let indexStarted = false;
+    let indexMetaText = '';
+    // Snapshot of persistent DB counts. Refreshed on page load and after each run
+    // ends — during a run we add progress.processedGuides on top of this snapshot
+    // to compute cumulative position without round-tripping per SSE event.
+    let indexDbStats = { totalGuides: 0, indexedGuides: 0, totalChunks: 0 };
+
+    function refreshIndexDbStats() {
+      return fetch('/api/admin/ai/index/status' + authSuffix)
+        .then(r => r.json())
+        .then(data => {
+          if (data.db) indexDbStats = data.db;
+          return data;
+        })
+        .catch(() => null);
+    }
+
+    function formatCount(n) {
+      return (n || 0).toLocaleString();
+    }
+
+    function connectIndexSSE() {
+      if (indexEventSource) indexEventSource.close();
+      indexEventSource = new EventSource('/api/admin/ai/index/stream' + authSuffix);
+
+      indexEventSource.onmessage = (event) => {
+        const progress = JSON.parse(event.data);
+        updateIndexUI(progress);
+      };
+
+      indexEventSource.onerror = () => {
+        indexEventSource.close();
+        indexEventSource = null;
+        const statusText = document.getElementById('indexStatusText');
+        if (statusText) statusText.textContent = 'Connection lost. Refresh to retry.';
+      };
+    }
+
+    function updateIndexUI(progress) {
+      const startBtn = document.getElementById('indexStartBtn');
+      const stopBtn = document.getElementById('indexStopBtn');
+      const statusDiv = document.getElementById('indexStatus');
+      const statusText = document.getElementById('indexStatusText');
+      const spinner = statusDiv.querySelector('.index-spinner');
+      const statsDiv = document.getElementById('indexStats');
+      const progressBar = document.getElementById('indexProgressBar');
+      const metaDiv = document.getElementById('indexMeta');
+
+      const isRunning = progress.status === 'running' || progress.status === 'stopping';
+      const isComplete = progress.status === 'complete';
+      const isError = progress.status === 'error';
+      const isIdle = progress.status === 'idle';
+
+      if (isRunning) indexStarted = true;
+
+      // Per-run stats (current session only — reset on each start)
+      document.getElementById('indexProcessed').textContent = formatCount(progress.processedGuides);
+      document.getElementById('indexSucceeded').textContent = formatCount(progress.succeededGuides);
+      document.getElementById('indexFailed').textContent = formatCount(progress.failedGuides);
+      document.getElementById('indexChunks').textContent = formatCount(progress.totalChunks);
+
+      // Cumulative position is computed server-side from a live DB count, so
+      // it stays correct regardless of when the panel was opened relative to
+      // the run.
+      const cumulativeIndexed = progress.cumulativeIndexed || 0;
+      const cumulativeTotal = progress.cumulativeTotal || 0;
+      const pct = cumulativeTotal > 0
+        ? Math.min(100, Math.round((cumulativeIndexed / cumulativeTotal) * 100))
+        : 0;
+      progressBar.style.width = pct + '%';
+
+      // Meta line: cumulative archive coverage + embedding host/model.
+      const coverageText = cumulativeTotal > 0
+        ? formatCount(cumulativeIndexed) + ' of ' + formatCount(cumulativeTotal) +
+          ' guides indexed (' + pct + '%) · ' + formatCount(indexDbStats.totalChunks) + ' chunks'
+        : '';
+      metaDiv.textContent = [coverageText, indexMetaText].filter(Boolean).join(' · ');
+
+      // Show the status block whenever there's anything to report — either
+      // a run in flight, or persistent prior progress to display.
+      const hasPriorProgress = cumulativeTotal > 0 && cumulativeIndexed > 0;
+      const shouldShowStatus = isRunning || isComplete || isError || indexStarted || hasPriorProgress;
+
+      if (!shouldShowStatus) {
+        startBtn.style.display = 'inline-block';
+        startBtn.disabled = false;
+        stopBtn.style.display = 'none';
+        statusDiv.style.display = 'none';
+        return;
+      }
+
+      // Per-run stats grid only makes sense during/after an in-flight run.
+      // On a cold load showing only persistent state, keep it hidden.
+      const showRunStats = isRunning || isComplete || isError || indexStarted;
+      statsDiv.style.display = showRunStats ? 'grid' : 'none';
+
+      if (isRunning) {
+        startBtn.style.display = 'none';
+        stopBtn.style.display = 'inline-block';
+        stopBtn.disabled = false;
+        stopBtn.textContent = progress.status === 'stopping' ? 'Stopping...' : 'Stop';
+        statusDiv.style.display = 'block';
+        spinner.style.display = 'block';
+        const runTotal = progress.totalGuides || 0;
+        const runDone = progress.processedGuides || 0;
+        const totalSuffix = runTotal > 0 ? ' / ' + formatCount(runTotal) : '';
+        statusText.textContent = progress.currentGuideTitle
+          ? 'Indexing (' + formatCount(runDone) + totalSuffix + ' this run): ' + progress.currentGuideTitle.slice(0, 50)
+          : (progress.message || 'Processing...');
+      } else if (isComplete) {
+        startBtn.style.display = 'inline-block';
+        startBtn.disabled = false;
+        stopBtn.style.display = 'none';
+        statusDiv.style.display = 'block';
+        spinner.style.display = 'none';
+        statusText.textContent = progress.message || 'Indexing complete.';
+        indexStarted = false;
+        // Run finished — refresh the persistent snapshot so the next render
+        // reflects the just-completed work without depending on per-run state.
+        refreshIndexDbStats().then(data => {
+          if (data && data.progress) {
+            // Re-render with fresh DB stats but the *same* progress so we don't
+            // flip back into a running state.
+            const metaDiv = document.getElementById('indexMeta');
+            const cumulativeIndexed = indexDbStats.indexedGuides;
+            const pct = indexDbStats.totalGuides > 0
+              ? Math.min(100, Math.round((cumulativeIndexed / indexDbStats.totalGuides) * 100))
+              : 0;
+            progressBar.style.width = pct + '%';
+            const coverageText = indexDbStats.totalGuides > 0
+              ? formatCount(cumulativeIndexed) + ' of ' + formatCount(indexDbStats.totalGuides) +
+                ' guides indexed (' + pct + '%) · ' + formatCount(indexDbStats.totalChunks) + ' chunks'
+              : '';
+            metaDiv.textContent = [coverageText, indexMetaText].filter(Boolean).join(' · ');
+          }
+        });
+      } else if (isError) {
+        startBtn.style.display = 'inline-block';
+        startBtn.disabled = false;
+        stopBtn.style.display = 'none';
+        statusDiv.style.display = 'block';
+        spinner.style.display = 'none';
+        statusText.textContent = 'Error: ' + (progress.error || progress.message || 'Unknown error');
+        indexStarted = false;
+      } else if (isIdle && indexStarted) {
+        startBtn.style.display = 'inline-block';
+        startBtn.disabled = false;
+        stopBtn.style.display = 'none';
+        statusDiv.style.display = 'block';
+        spinner.style.display = 'none';
+        statusText.textContent = 'Stopped.';
+        indexStarted = false;
+        refreshIndexDbStats();
+      } else if (isIdle && hasPriorProgress) {
+        // Cold load with prior progress — show coverage but keep idle controls.
+        startBtn.style.display = 'inline-block';
+        startBtn.disabled = false;
+        stopBtn.style.display = 'none';
+        statusDiv.style.display = 'block';
+        spinner.style.display = 'none';
+        statusText.textContent = 'Idle. Resume indexing to continue.';
+      }
+    }
+
+    document.getElementById('indexStartBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('indexStartBtn');
+      const statusDiv = document.getElementById('indexStatus');
+      const statusText = document.getElementById('indexStatusText');
+      const spinner = statusDiv.querySelector('.index-spinner');
+
+      indexStarted = true;
+      btn.disabled = true;
+      btn.style.display = 'none';
+      document.getElementById('indexStopBtn').style.display = 'inline-block';
+      statusDiv.style.display = 'block';
+      spinner.style.display = 'block';
+      statusText.textContent = 'Starting indexing...';
+
+      try {
+        const response = await fetch('/api/admin/ai/index/start' + authSuffix, { method: 'POST' });
+        const data = await response.json();
+        if (response.ok) {
+          indexMetaText = (data.embeddingHost || '') + ' / ' + (data.embeddingModel || '') +
+            (data.annIndexSize ? ' (ANN: ' + Number(data.annIndexSize).toLocaleString() + ' vectors)' : '');
+          document.getElementById('indexMeta').textContent = indexMetaText;
+          statusText.textContent = 'Connecting...';
+          connectIndexSSE();
+        } else {
+          statusText.textContent = 'Error: ' + (data.error || 'Failed to start');
+          if (data.details) statusText.textContent += ' (' + data.details + ')';
+          spinner.style.display = 'none';
+          indexStarted = false;
+          setTimeout(() => {
+            statusDiv.style.display = 'none';
+            btn.style.display = 'inline-block';
+            btn.disabled = false;
+            document.getElementById('indexStopBtn').style.display = 'none';
+          }, 4000);
+        }
+      } catch (error) {
+        statusText.textContent = 'Error: ' + error.message;
+        spinner.style.display = 'none';
+        indexStarted = false;
+        setTimeout(() => {
+          statusDiv.style.display = 'none';
+          btn.style.display = 'inline-block';
+          btn.disabled = false;
+          document.getElementById('indexStopBtn').style.display = 'none';
+        }, 4000);
+      }
+    });
+
+    document.getElementById('indexStopBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('indexStopBtn');
+      btn.disabled = true;
+      btn.textContent = 'Stopping...';
+      try {
+        await fetch('/api/admin/ai/index/stop' + authSuffix, { method: 'POST' });
+      } catch (error) {
+        console.error('Stop failed:', error);
+        btn.disabled = false;
+        btn.textContent = 'Stop';
+      }
+    });
+
+    // Resume on page load if indexing is already running and seed cumulative stats.
+    function checkIndexStatus() {
+      fetch('/api/admin/ai/index/status' + authSuffix)
+        .then(r => r.json())
+        .then(data => {
+          if (data.embeddingHost) {
+            indexMetaText = data.embeddingHost + ' / ' + data.embeddingModel +
+              (data.annIndexSize ? ' (ANN: ' + Number(data.annIndexSize).toLocaleString() + ' vectors)' : '');
+          }
+          if (data.db) indexDbStats = data.db;
+          if (data.progress) {
+            updateIndexUI(data.progress);
+            if (data.progress.status === 'running' || data.progress.status === 'stopping') {
+              connectIndexSSE();
+            }
+          }
+        })
+        .catch(() => {});
+    }
+    checkIndexStatus();
   </script>
 </body>
 </html>

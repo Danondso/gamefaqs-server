@@ -1,11 +1,31 @@
 import Database from 'better-sqlite3';
-import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH, FILTER_LOOKUP_TRIGGERS, SCHEMA_VERSION } from './schema';
+import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH, FILTER_LOOKUP_TRIGGERS, RAG_DDL, GAMES_FTS_DDL, SCHEMA_VERSION } from './schema';
 
 export interface Migration {
   version: number;
   up: (db: Database.Database) => void;
   down?: (db: Database.Database) => void;
 }
+
+// Title-relabel CASE for migration v5. Evaluated against `g` (guides row) and
+// `gm` (joined games row): returns `${gm.title} — ${author}` when the author
+// passes the cleanliness filter, otherwise `${gm.title}`.
+//
+// IMPORTANT: must stay in sync with cleanAuthor() in GuideImporter.ts. The
+// `cleanAuthor` parity test in tests/cleanAuthorParity.test.ts evaluates this
+// SQL against the JS implementation across a parameter table to catch drift.
+export const TITLE_RELABEL_CASE_SQL = `CASE
+            WHEN json_extract(g.metadata, '$.author') IS NOT NULL
+              AND LENGTH(TRIM(json_extract(g.metadata, '$.author'))) BETWEEN 2 AND 60
+              AND instr(json_extract(g.metadata, '$.author'), char(10)) = 0
+              AND instr(json_extract(g.metadata, '$.author'), '|') = 0
+              AND instr(json_extract(g.metadata, '$.author'), '=') = 0
+              AND instr(json_extract(g.metadata, '$.author'), '>') = 0
+              AND (LENGTH(TRIM(json_extract(g.metadata, '$.author')))
+                   - LENGTH(REPLACE(TRIM(json_extract(g.metadata, '$.author')), ' ', ''))) <= 5
+            THEN gm.title || ' — ' || TRIM(json_extract(g.metadata, '$.author'))
+            ELSE gm.title
+          END`;
 
 // Migration v1: Initial schema
 const migration_v1: Migration = {
@@ -137,8 +157,107 @@ const migration_v4: Migration = {
   },
 };
 
+// Migration v5: RAG bring-up + title relabel. Adds chunks table, chunk FTS,
+// fts5vocab views for rare-token filtering, the indexer's per-guide
+// checkpoint column with its composite cursor index, the games_fts virtual
+// table for direct game-name lookup at retrieval time, and relabels existing
+// guide titles to the linked game's name (the parser's content-extracted
+// title is unreliable — banners and bylines slip through). Vectors live in
+// the ANN file (`${dbPath}.ann`, see AnnIndex), not in SQLite.
+//
+// The relabel UPDATE is idempotent: rows with metadata.original_title set
+// are skipped, so this is safe on fresh DBs (zero rows match) and on
+// already-relabeled DBs.
+const migration_v5: Migration = {
+  version: 5,
+  up: (db: Database.Database) => {
+    console.log('[Migrations] Applying RAG schema, games_fts, and title relabel...');
+
+    db.exec('ALTER TABLE guides ADD COLUMN indexed_at INTEGER');
+    // Composite (indexed_at, id) serves both `indexed_at IS NULL` filtering
+    // and the indexer's `ORDER BY id` cursor — no separate single-column
+    // index needed.
+    db.exec('CREATE INDEX IF NOT EXISTS idx_guides_indexed_at_id ON guides(indexed_at, id)');
+
+    db.exec(CREATE_TABLES.chunks);
+    db.exec(CREATE_INDEXES.chunks_guide_id);
+
+    db.exec(RAG_DDL.chunksFts);
+    db.exec(RAG_DDL.chunksFtsInsert);
+    db.exec(RAG_DDL.chunksFtsDelete);
+
+    // fts5vocab virtual tables expose (term, doc, col) over an FTS5 index
+    // in `row` mode — per-term distinct-document counts in O(log n). Used
+    // by RetrievalService.filterToRareChunkTokens / filterToRareTitleTokens
+    // to drop common tokens before BM25 scoring.
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_vocab USING fts5vocab(chunks_fts, row)`);
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS guides_fts_meta_vocab USING fts5vocab(guides_fts_meta, row)`);
+
+    // games_fts powers RetrievalService.defaultGameMatch — phrase-matching
+    // question n-grams against game titles. Triggers keep it in sync after
+    // bring-up; the backfill below seeds it from existing rows.
+    db.exec(GAMES_FTS_DDL.gamesFts);
+    db.exec(GAMES_FTS_DDL.gamesFtsInsert);
+    db.exec(GAMES_FTS_DDL.gamesFtsUpdate);
+    db.exec(GAMES_FTS_DDL.gamesFtsDelete);
+
+    // Title relabel: stash original title in metadata.original_title AND set
+    // the new title in one shot, so the guides_fts_meta_update trigger fires
+    // exactly once per row.
+    // The author filter must stay in sync with cleanAuthor() in
+    // GuideImporter.ts: length 2..60, no newlines / | / = / >, and ≤ 5 spaces
+    // (the parser sometimes grabs whole sentences).
+    const txn = db.transaction(() => {
+      db.exec(`INSERT INTO games_fts(game_id, title) SELECT id, title FROM games`);
+      db.exec(`
+        UPDATE guides AS g
+        SET
+          metadata = json_set(COALESCE(g.metadata, '{}'), '$.original_title', g.title),
+          title = ${TITLE_RELABEL_CASE_SQL}
+        FROM games gm
+        WHERE g.game_id = gm.id
+          AND TRIM(gm.title) != ''
+          AND json_extract(g.metadata, '$.original_title') IS NULL
+      `);
+      db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (5, ${Date.now()})`);
+    });
+    txn();
+
+    console.log('[Migrations] v5 applied');
+  },
+  down: (db: Database.Database) => {
+    // Restore titles from metadata.original_title where present.
+    db.exec(`
+      UPDATE guides
+      SET
+        title = json_extract(metadata, '$.original_title'),
+        metadata = json_remove(metadata, '$.original_title')
+      WHERE json_extract(metadata, '$.original_title') IS NOT NULL
+    `);
+    db.exec('DROP TRIGGER IF EXISTS games_fts_delete');
+    db.exec('DROP TRIGGER IF EXISTS games_fts_update');
+    db.exec('DROP TRIGGER IF EXISTS games_fts_insert');
+    db.exec('DROP TABLE IF EXISTS games_fts');
+    db.exec('DROP TABLE IF EXISTS guides_fts_meta_vocab');
+    db.exec('DROP TABLE IF EXISTS chunks_fts_vocab');
+    db.exec('DROP TRIGGER IF EXISTS chunks_fts_delete');
+    db.exec('DROP TRIGGER IF EXISTS chunks_fts_insert');
+    db.exec('DROP TABLE IF EXISTS chunks_fts');
+    db.exec('DROP INDEX IF EXISTS idx_chunks_guide_id');
+    db.exec('DROP TABLE IF EXISTS chunks');
+    db.exec('DROP INDEX IF EXISTS idx_guides_indexed_at_id');
+    // SQLite 3.35+ supports DROP COLUMN
+    try {
+      db.exec('ALTER TABLE guides DROP COLUMN indexed_at');
+    } catch (err: any) {
+      console.warn('[Migrations] Could not drop column indexed_at (older SQLite?):', err.message);
+    }
+    db.exec('DELETE FROM schema_version WHERE version = 5');
+  },
+};
+
 // All migrations in order
-export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4];
+export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5];
 
 // Get current schema version from database
 export function getCurrentVersion(db: Database.Database): number {

@@ -9,19 +9,44 @@ services:
       # Persistent data storage (~5-10GB for full import)
       # For more disk space, use host path: - ./data:/data/db
       - gamefaqs-data:/data/db
-      # Temporary storage for downloads and extraction (~15GB peak)
+      # Temporary storage for extraction (~15GB peak during import, freed after)
       # For more disk space, use host path: - ./temp:/tmp/gamefaqs
       - gamefaqs-temp:/tmp/gamefaqs
+      # Persistent archive cache (~12 GB). Bind-mounted to a host path so it
+      # survives BOTH `docker compose down -v` AND `docker volume rm` — the
+      # archive lives outside docker's volume management entirely. This lets
+      # you nuke the DB and start fresh without re-downloading. Change the
+      # left side to wherever you want the cache to live on the host.
+      - ./archive:/archive
+    # host.docker.internal -> host machine, so the container can reach the
+    # Ollama daemon running on the host. Required on Linux; on Docker Desktop
+    # (Mac/Windows) it resolves automatically.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - NODE_ENV=production
       - PORT=3000
       - DB_PATH=/data/db/gamefaqs.db
       - TEMP_DIR=/tmp/gamefaqs
+      # Where the downloaded archive is cached. Decoupled from TEMP_DIR so it
+      # survives `docker compose down -v` (the gamefaqs-archive volume is a
+      # separate named volume — see volumes section). Combined with
+      # KEEP_ARCHIVE=true below, this means you only download the ~12 GB once.
+      - ARCHIVE_DIR=/archive
+      # Set to "true" to keep gamefaqs_archive.zip after extraction so a future
+      # fresh setup can reuse it instead of re-downloading ~12 GB. Default
+      # deletes it after extract to free disk during import.
+      - KEEP_ARCHIVE=true
       # Optional: Set admin token for panel protection
       - ADMIN_TOKEN=your-secret-token
-      # Optional: Ollama integration for AI-powered metadata
-      - OLLAMA_HOST=http://localhost:11434
+      # Talks to host-side Ollama. If your host Ollama only listens on 127.0.0.1
+      # (the default), set OLLAMA_HOST=0.0.0.0 in your host Ollama service so
+      # the container can reach it via host-gateway.
+      - OLLAMA_HOST=http://host.docker.internal:11434
       - OLLAMA_MODEL=qwen3:latest # set your default here, you can change it in the admin panel
+      # RAG synthesis: model that takes retrieved chunks + question and writes
+      # the answer. Override via SYNTHESIS_MODEL.
+      - SYNTHESIS_MODEL=granite4
     healthcheck:
       test:
         [

@@ -2,9 +2,14 @@ import { Router, Request, Response, NextFunction } from 'express';
 import DefaultGuideModel from '../models/Guide';
 import { config } from '../config';
 import type { IGuideModel, GuideFilters } from '../interfaces/IGuideModel';
+import type { AnswerService } from '../services/AnswerService';
+import { createSlidingWindowRateLimiter } from '../middleware/rateLimit';
 
 export interface GuidesRouterDeps {
   guideModel: IGuideModel;
+  // Optional: tests and the legacy default export can omit this. When omitted,
+  // POST /answer responds with 503 ("answer service not configured").
+  answerService?: AnswerService;
 }
 
 /**
@@ -23,7 +28,89 @@ function sanitizeContentDispositionFilename(filename: string): string {
 
 export function createGuidesRouter(deps: GuidesRouterDeps): Router {
   const router = Router();
-  const { guideModel } = deps;
+  const { guideModel, answerService } = deps;
+
+  // Sliding-window rate limiter, scoped to /answer only (other guide endpoints
+  // are unaffected). Per-router instance so each test app gets its own store.
+  const answerRateLimiter = createSlidingWindowRateLimiter({
+    windowMs: 60_000,
+    max: config.answerRateLimitPerMin,
+  });
+
+  // POST /api/guides/answer — RAG question answering over the indexed guides.
+  // Defined before /:id so Express doesn't route the literal "answer" through
+  // the :id handler.
+  router.post('/answer', answerRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { question, game_id, platform, genre, tags, tag_match, top_k } = req.body ?? {};
+
+      if (typeof question !== 'string' || question.trim().length === 0) {
+        res.status(400).json({ error: 'question is required' });
+        return;
+      }
+      if (question.length > 1000) {
+        res.status(400).json({ error: 'question must be 1000 characters or fewer' });
+        return;
+      }
+      if (game_id !== undefined && typeof game_id !== 'string') {
+        res.status(400).json({ error: 'game_id must be a string' });
+        return;
+      }
+      if (platform !== undefined && typeof platform !== 'string') {
+        res.status(400).json({ error: 'platform must be a string' });
+        return;
+      }
+      if (genre !== undefined && typeof genre !== 'string') {
+        res.status(400).json({ error: 'genre must be a string' });
+        return;
+      }
+      if (tags !== undefined && (!Array.isArray(tags) || !tags.every(t => typeof t === 'string'))) {
+        res.status(400).json({ error: 'tags must be an array of strings' });
+        return;
+      }
+      if (tag_match !== undefined && tag_match !== 'any' && tag_match !== 'all') {
+        res.status(400).json({ error: "tag_match must be 'any' or 'all'" });
+        return;
+      }
+      let topK = config.ragTopK;
+      if (top_k !== undefined) {
+        if (typeof top_k !== 'number' || !Number.isInteger(top_k) || top_k < 1 || top_k > 20) {
+          res.status(400).json({ error: 'top_k must be an integer between 1 and 20' });
+          return;
+        }
+        topK = top_k;
+      }
+
+      if (!answerService) {
+        res.status(503).json({ error: 'Answer service not configured' });
+        return;
+      }
+
+      try {
+        const result = await answerService.answer(
+          question.trim(),
+          { gameId: game_id, platform, genre, tags, tagMatch: tag_match },
+          topK
+        );
+        res.json(result);
+      } catch (err: any) {
+        // Distinguish embedding-host failures from synthesis-host failures so
+        // operators can tell which Ollama is down.
+        const message = err?.message ?? '';
+        if (message.startsWith('Embedding API error') || message.includes('Embedding dim mismatch') || message === 'TIMEOUT') {
+          res.status(503).json({ error: 'Embedding service unavailable' });
+          return;
+        }
+        if (message.startsWith('Synthesis API error')) {
+          res.status(503).json({ error: 'Synthesis service unavailable' });
+          return;
+        }
+        next(err);
+      }
+    } catch (error) {
+      next(error);
+    }
+  });
 
   // GET /api/guides - List all guides (paginated, with optional filters)
   router.get('/', (req: Request, res: Response, next: NextFunction) => {

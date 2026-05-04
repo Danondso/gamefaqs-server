@@ -71,7 +71,12 @@ ADMIN_TOKEN=                  # Token to protect admin panel (empty = open acces
 
 # Ollama AI Integration (optional)
 OLLAMA_HOST=http://localhost:11434
-OLLAMA_MODEL=llama3.2
+OLLAMA_MODEL=qwen3:latest        # Default model for general AI features
+SYNTHESIS_MODEL=qwen3:1.7b       # Model that synthesizes /api/guides/answer responses
+                                 # (smaller = faster; trades some refusal discipline on edge cases)
+
+# MCP Server (optional)
+GAMEFAQS_API_URL=             # If set, MCP server proxies to this REST API instead of opening the local DB
 ```
 
 ## First Startup Behavior
@@ -85,7 +90,11 @@ When the server starts for the first time with an empty database:
 
 **Total time:** 20-40 minutes depending on system performance
 
-**Subsequent startups:** Instant (<5 seconds) - database persists
+**Subsequent startups:** Instant (<5 seconds) - database persists. Migrations run automatically; upgrading an existing DB to schema v5 will relabel guide titles in-place to `Game Name` or `Game Name — Author` (the previous content-extracted titles often picked up ASCII banners or bylines). The original parsed title is preserved on each row under `metadata.original_title`. Schema v5 also adds the `games_fts` virtual table that the answer endpoint uses for direct game-name lookup.
+
+### Guide title format
+
+Guide titles returned by the API are derived from the linked game's name rather than the guide file's content, so titles in `/api/guides/*` responses look like `Final Fantasy VII` or `Final Fantasy VII — SomeAuthor`. This also makes the `/api/guides/answer` retriever more reliable for game-named questions: four sources (vector KNN, content FTS, title-aware BM25, and game-name phrase match against `games_fts`) are fused with reciprocal-rank, so chunks from the right guide get boosted even when the chunk text doesn't repeat the game's name. Asking "How do I beat the Elite Four in Pokemon Red?" reliably retrieves Pokemon Red guides; on the May 2026 50k-guide corpus, specific-installment questions land at 100% recall@8. See [`BENCHMARKING.md`](./BENCHMARKING.md) for the methodology and the time-series across the indexing run.
 
 ## API Documentation
 
@@ -166,16 +175,19 @@ node -e "const db = require('better-sqlite3')(':memory:'); db.prepare('CREATE VI
 
 ## Ollama AI Integration (Optional)
 
-Ollama provides AI-powered metadata extraction for guides with incomplete or incorrect metadata.
+Ollama powers two things: metadata extraction for guides with incomplete metadata, and the `/api/guides/answer` synthesis step.
 
 **Setup:**
 ```bash
-# Start Ollama container
+# Start Ollama container (or run on the host)
 docker run -d -p 11434:11434 --name ollama ollama/ollama
 
-# Pull model
-docker exec ollama ollama pull llama3.2
+# Pull the default models
+docker exec ollama ollama pull qwen3:latest    # OLLAMA_MODEL — metadata / general use
+docker exec ollama ollama pull qwen3:1.7b      # SYNTHESIS_MODEL — answer synthesis
 ```
+
+The synthesis model defaults to `qwen3:1.7b` because it lands ~40% faster synth latency at the same retrieval recall as larger variants. It's slightly more eager to answer when it shouldn't (trick / unanswerable questions get worse refusal discipline) — acceptable for a guide-archive Q&A tool where real questions name the game and want a direct answer. Bump to `qwen3:8b` via `SYNTHESIS_MODEL` if refusal discipline matters more than latency.
 
 ## Admin Panel Security
 
@@ -197,6 +209,10 @@ export ADMIN_TOKEN=$(uuidgen)
 node -e "console.log(require('crypto').randomUUID())"
 ```
 
+### `/api/guides/answer` exposure
+
+`ADMIN_TOKEN` only gates `/api/admin/*`. `POST /api/guides/answer` is unauthenticated and triggers Ollama embedding + synthesis per request — both are GPU/CPU-expensive. The built-in sliding-window limiter (`ANSWER_RATE_LIMIT`, default 10/min/IP) is the only protection. Do **not** put this endpoint on the open internet without a reverse-proxy auth layer (basic auth, OAuth, or IP allowlist); a small botnet trivially exhausts per-IP limits and runs your Ollama bill / saturates the GPU. Same applies to MCP remote mode, which proxies through this endpoint.
+
 ## Performance Notes
 
 - **Memory:** 200-500MB normal, 1-2GB during extraction
@@ -210,6 +226,67 @@ services:
     mem_limit: 2G
     mem_reservation: 512M
 ```
+
+## MCP Server
+
+An MCP (Model Context Protocol) server is included so AI assistants can search and read the archive directly. It exposes six tools: `search_guides`, `search_games`, `read_guide`, `get_game`, `browse_guides`, and `get_archive_stats`.
+
+**Run modes:**
+
+```bash
+# Local mode — opens the SQLite DB directly (DB_PATH must be readable)
+npm run mcp
+
+# Remote mode — proxies all reads to a running gamefaqs-server REST API.
+# Useful when the MCP host doesn't have the ~5-10GB database locally.
+GAMEFAQS_API_URL=http://your-server:3000 npm run mcp
+```
+
+In remote mode the MCP process never opens SQLite, so it works on machines without `DB_PATH`. The remote server's `/api/guides` and `/api/games` endpoints are unauthenticated, so no token is required even when `ADMIN_TOKEN` is set on the remote box.
+
+**Production build:**
+```bash
+npm run build
+GAMEFAQS_API_URL=http://your-server:3000 npm run mcp:start
+```
+
+### Docker
+
+A separate `Dockerfile.mcp` builds an image that runs the MCP server over stdio. No port is exposed; the AI client launches `docker run` and pipes stdin/stdout.
+
+```bash
+# Build once
+npm run docker:mcp:build
+
+# Remote mode — point at a running gamefaqs-server. No volume needed.
+docker run --rm -i \
+  -e GAMEFAQS_API_URL=http://your-server:3000 \
+  gamefaqs-mcp
+
+# Local mode — share the SQLite volume with the main server container.
+docker run --rm -i \
+  -v gamefaqs-data:/data/db \
+  gamefaqs-mcp
+```
+
+**Wiring into an MCP client (e.g. Claude Desktop):**
+
+```json
+{
+  "mcpServers": {
+    "gamefaqs": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "GAMEFAQS_API_URL=http://your-server:3000",
+        "gamefaqs-mcp"
+      ]
+    }
+  }
+}
+```
+
+The `-i` flag is required (stdin must stay open). Don't add `-t`; the AI client isn't a TTY.
 
 ## Related Projects
 

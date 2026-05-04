@@ -15,7 +15,8 @@ declare module 'node-7z' {
   }
 
   function extractFull(archivePath: string, outputDir: string, options?: ExtractOptions): SevenStream;
+  function list(archivePath: string, options?: ExtractOptions): SevenStream;
 
-  export default { extractFull };
-  export { extractFull };
+  export default { extractFull, list };
+  export { extractFull, list };
 }

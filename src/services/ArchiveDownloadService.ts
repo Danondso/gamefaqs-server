@@ -99,6 +99,21 @@ class ArchiveDownloadService {
       return false;
     }
   }
+
+  /**
+   * HEAD the URL and return Content-Length, or null if unknown / unreachable.
+   * Used to decide whether a previously-downloaded archive on disk is still
+   * complete and can be reused.
+   */
+  async getRemoteSize(url: string): Promise<number | null> {
+    try {
+      const response = await axios.head(url, { timeout: 10000 });
+      const length = parseInt(response.headers['content-length'] || '0', 10);
+      return length > 0 ? length : null;
+    } catch {
+      return null;
+    }
+  }
 }
 
 export default new ArchiveDownloadService();

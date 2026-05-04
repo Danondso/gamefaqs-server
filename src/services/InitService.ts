@@ -51,29 +51,54 @@ class InitService {
 
       this.status.startTime = Date.now();
 
-      // Ensure temp directory exists
+      // Ensure temp + archive directories exist. archiveDir is intentionally
+      // decoupled from tempDir so the operator can mount it from a persistent
+      // host path; that lets the archive survive volume wipes (e.g.
+      // `docker compose down -v`) and avoids re-downloading ~12 GB.
       if (!fs.existsSync(config.tempDir)) {
         fs.mkdirSync(config.tempDir, { recursive: true });
+      }
+      if (!fs.existsSync(config.archiveDir)) {
+        fs.mkdirSync(config.archiveDir, { recursive: true });
       }
 
       // Stage 1: Download archive (30% of progress)
       this.updateStatus('downloading', 0, 'Downloading archive from Internet Archive...');
-      const archivePath = path.join(config.tempDir, 'gamefaqs_archive.zip');
+      const archivePath = path.join(config.archiveDir, 'gamefaqs_archive.zip');
 
-      await ArchiveDownloadService.downloadArchive(
-        config.archiveUrl,
-        archivePath,
-        (progress) => {
-          const percentage = Math.floor(progress.percentage * 0.3);
-          const downloaded = (progress.downloaded / 1024 / 1024).toFixed(1);
-          const total = progress.total > 0 
-            ? (progress.total / 1024 / 1024).toFixed(1)
-            : '?';
-          this.updateStatus('downloading', percentage, `Downloading: ${downloaded}MB / ${total}MB`);
+      // Reuse any archive already on disk. Saves a ~12 GB re-download for
+      // users who ran with KEEP_ARCHIVE=true on a prior setup, and supports
+      // the "browser-download the file faster, then drop it in" workflow.
+      // We never auto-delete a file the operator put here — if it's actually
+      // corrupt or truncated, extraction will fail loudly downstream.
+      let skipDownload = false;
+      if (fs.existsSync(archivePath)) {
+        const localSize = fs.statSync(archivePath).size;
+        const remoteSize = await ArchiveDownloadService.getRemoteSize(config.archiveUrl);
+        if (remoteSize !== null && localSize !== remoteSize) {
+          console.warn(`[Init] Existing archive size mismatch (local ${localSize}, remote ${remoteSize}) — using it anyway; extraction will fail if it's truncated`);
+        } else {
+          console.log(`[Init] Found existing archive at ${archivePath} (${(localSize / 1024 / 1024).toFixed(1)} MB) — skipping download`);
         }
-      );
+        this.updateStatus('downloading', 30, 'Reusing existing archive');
+        skipDownload = true;
+      }
 
-      console.log('[Init] Download complete');
+      if (!skipDownload) {
+        await ArchiveDownloadService.downloadArchive(
+          config.archiveUrl,
+          archivePath,
+          (progress) => {
+            const percentage = Math.floor(progress.percentage * 0.3);
+            const downloaded = (progress.downloaded / 1024 / 1024).toFixed(1);
+            const total = progress.total > 0
+              ? (progress.total / 1024 / 1024).toFixed(1)
+              : '?';
+            this.updateStatus('downloading', percentage, `Downloading: ${downloaded}MB / ${total}MB`);
+          }
+        );
+        console.log('[Init] Download complete');
+      }
 
       // Stage 2: Extract archives (30% of progress, offset 30)
       this.updateStatus('extracting', 30, 'Extracting ZIP and 7z archives...');
@@ -95,18 +120,24 @@ class InitService {
 
       console.log('[Init] Extraction complete');
 
-      // Delete original archive to save space
-      console.log('[Init] Deleting archive to free space...');
-      try {
-        fs.unlinkSync(archivePath);
-      } catch (err) {
-        console.warn('[Init] Could not delete archive:', err);
+      // Free the ~12 GB archive unless the operator opted to keep it for
+      // future setups. Keeping is useful if you anticipate yeeting the DB
+      // and don't want to re-download.
+      if (config.keepArchive) {
+        console.log(`[Init] Keeping archive at ${archivePath} (KEEP_ARCHIVE=true)`);
+      } else {
+        console.log('[Init] Deleting archive to free space (set KEEP_ARCHIVE=true to retain)...');
+        try {
+          fs.unlinkSync(archivePath);
+        } catch (err) {
+          console.warn('[Init] Could not delete archive:', err);
+        }
       }
 
       // Stage 3: Import guides (40% of progress, offset 60)
       this.updateStatus('importing', 60, 'Importing guides to database...');
 
-      const result = await GuideImporter.importFromDirectory(
+      await GuideImporter.importFromDirectory(
         extractedDir,
         (progress) => {
           const percentage = 60 + Math.floor((progress.current / Math.max(progress.total, 1)) * 40);
@@ -115,11 +146,6 @@ class InitService {
           );
         }
       );
-
-      console.log('[Init] Import complete!');
-      console.log(`[Init]   Imported: ${result.imported.toLocaleString()} guides`);
-      console.log(`[Init]   Errors: ${result.errors}`);
-      console.log(`[Init]   Skipped: ${result.skipped}`);
 
       // Cleanup extracted files
       console.log('[Init] Cleaning up temporary files...');
@@ -164,6 +190,13 @@ class InitService {
     }
   }
 
+  // Track what we last printed so progress stages don't spam the log: SSE
+  // listeners still get every update, but stdout only sees one line per
+  // integer percentage tick (Docker logs) or in-place updates (TTY).
+  private lastLoggedStage: InitStatus['stage'] | null = null;
+  private lastLoggedProgress = -1;
+  private progressLineActive = false;
+
   private updateStatus(
     stage: InitStatus['stage'],
     progress: number,
@@ -180,7 +213,39 @@ class InitService {
       gameCount: gameCount ?? this.status.gameCount,
     };
     this.notifyListeners();
-    console.log(`[Init] ${message} (${progress}%)`);
+    this.logProgress(stage, progress, message);
+  }
+
+  private logProgress(stage: InitStatus['stage'], progress: number, message: string): void {
+    const isProgressStage = stage === 'downloading' || stage === 'extracting' || stage === 'importing';
+    const stageChanged = stage !== this.lastLoggedStage;
+
+    // Close out an in-progress \r line before emitting anything new.
+    if (stageChanged && this.progressLineActive) {
+      process.stdout.write('\n');
+      this.progressLineActive = false;
+    }
+
+    if (!isProgressStage) {
+      console.log(`[Init] ${message} (${progress}%)`);
+      this.lastLoggedStage = stage;
+      this.lastLoggedProgress = -1;
+      return;
+    }
+
+    // Skip duplicate ticks within a progress stage.
+    if (!stageChanged && progress === this.lastLoggedProgress) return;
+
+    const line = `[Init] ${message} (${progress}%)`;
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\r\x1b[K${line}`);
+      this.progressLineActive = true;
+    } else {
+      console.log(line);
+    }
+
+    this.lastLoggedStage = stage;
+    this.lastLoggedProgress = progress;
   }
 
   getStatus(): InitStatus {

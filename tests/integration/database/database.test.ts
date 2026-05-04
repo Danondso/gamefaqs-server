@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDatabase } from '../../helpers/testDb';
 import type { IDatabase } from '../../../src/interfaces/IDatabase';
+import { SCHEMA_VERSION } from '../../../src/database/schema';
 
 describe('Database', () => {
   let db: IDatabase;
@@ -40,7 +41,7 @@ describe('Database', () => {
 
     it('should record schema version', () => {
       const version = db.get<{ version: number }>('SELECT version FROM schema_version ORDER BY version DESC LIMIT 1');
-      expect(version?.version).toBe(2);
+      expect(version?.version).toBe(SCHEMA_VERSION);
     });
   });
 
