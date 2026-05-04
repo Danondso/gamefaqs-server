@@ -7,6 +7,26 @@ export interface Migration {
   down?: (db: Database.Database) => void;
 }
 
+// Title-relabel CASE for migration v5. Evaluated against `g` (guides row) and
+// `gm` (joined games row): returns `${gm.title} — ${author}` when the author
+// passes the cleanliness filter, otherwise `${gm.title}`.
+//
+// IMPORTANT: must stay in sync with cleanAuthor() in GuideImporter.ts. The
+// `cleanAuthor` parity test in tests/cleanAuthorParity.test.ts evaluates this
+// SQL against the JS implementation across a parameter table to catch drift.
+export const TITLE_RELABEL_CASE_SQL = `CASE
+            WHEN json_extract(g.metadata, '$.author') IS NOT NULL
+              AND LENGTH(TRIM(json_extract(g.metadata, '$.author'))) BETWEEN 2 AND 60
+              AND instr(json_extract(g.metadata, '$.author'), char(10)) = 0
+              AND instr(json_extract(g.metadata, '$.author'), '|') = 0
+              AND instr(json_extract(g.metadata, '$.author'), '=') = 0
+              AND instr(json_extract(g.metadata, '$.author'), '>') = 0
+              AND (LENGTH(TRIM(json_extract(g.metadata, '$.author')))
+                   - LENGTH(REPLACE(TRIM(json_extract(g.metadata, '$.author')), ' ', ''))) <= 5
+            THEN gm.title || ' — ' || TRIM(json_extract(g.metadata, '$.author'))
+            ELSE gm.title
+          END`;
+
 // Migration v1: Initial schema
 const migration_v1: Migration = {
   version: 1,
@@ -139,7 +159,8 @@ const migration_v4: Migration = {
 
 // Migration v5: RAG bring-up + title relabel. Adds chunks table, chunk FTS,
 // fts5vocab views for rare-token filtering, the indexer's per-guide
-// checkpoint column with its composite cursor index, and relabels existing
+// checkpoint column with its composite cursor index, the games_fts virtual
+// table for direct game-name lookup at retrieval time, and relabels existing
 // guide titles to the linked game's name (the parser's content-extracted
 // title is unreliable — banners and bylines slip through). Vectors live in
 // the ANN file (`${dbPath}.ann`, see AnnIndex), not in SQLite.
@@ -150,7 +171,7 @@ const migration_v4: Migration = {
 const migration_v5: Migration = {
   version: 5,
   up: (db: Database.Database) => {
-    console.log('[Migrations] Applying RAG schema + title relabel...');
+    console.log('[Migrations] Applying RAG schema, games_fts, and title relabel...');
 
     db.exec('ALTER TABLE guides ADD COLUMN indexed_at INTEGER');
     // Composite (indexed_at, id) serves both `indexed_at IS NULL` filtering
@@ -167,34 +188,32 @@ const migration_v5: Migration = {
 
     // fts5vocab virtual tables expose (term, doc, col) over an FTS5 index
     // in `row` mode — per-term distinct-document counts in O(log n). Used
-    // by RetrievalService.filterToRareChunkTokens to drop common tokens
-    // before BM25 scoring.
+    // by RetrievalService.filterToRareChunkTokens / filterToRareTitleTokens
+    // to drop common tokens before BM25 scoring.
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_vocab USING fts5vocab(chunks_fts, row)`);
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS guides_fts_meta_vocab USING fts5vocab(guides_fts_meta, row)`);
+
+    // games_fts powers RetrievalService.defaultGameMatch — phrase-matching
+    // question n-grams against game titles. Triggers keep it in sync after
+    // bring-up; the backfill below seeds it from existing rows.
+    db.exec(GAMES_FTS_DDL.gamesFts);
+    db.exec(GAMES_FTS_DDL.gamesFtsInsert);
+    db.exec(GAMES_FTS_DDL.gamesFtsUpdate);
+    db.exec(GAMES_FTS_DDL.gamesFtsDelete);
 
     // Title relabel: stash original title in metadata.original_title AND set
     // the new title in one shot, so the guides_fts_meta_update trigger fires
     // exactly once per row.
-    // The author filter must stay in sync with isLikelyAuthor() in
+    // The author filter must stay in sync with cleanAuthor() in
     // GuideImporter.ts: length 2..60, no newlines / | / = / >, and ≤ 5 spaces
     // (the parser sometimes grabs whole sentences).
     const txn = db.transaction(() => {
+      db.exec(`INSERT INTO games_fts(game_id, title) SELECT id, title FROM games`);
       db.exec(`
         UPDATE guides AS g
         SET
           metadata = json_set(COALESCE(g.metadata, '{}'), '$.original_title', g.title),
-          title = CASE
-            WHEN json_extract(g.metadata, '$.author') IS NOT NULL
-              AND LENGTH(TRIM(json_extract(g.metadata, '$.author'))) BETWEEN 2 AND 60
-              AND instr(json_extract(g.metadata, '$.author'), char(10)) = 0
-              AND instr(json_extract(g.metadata, '$.author'), '|') = 0
-              AND instr(json_extract(g.metadata, '$.author'), '=') = 0
-              AND instr(json_extract(g.metadata, '$.author'), '>') = 0
-              AND (LENGTH(TRIM(json_extract(g.metadata, '$.author')))
-                   - LENGTH(REPLACE(TRIM(json_extract(g.metadata, '$.author')), ' ', ''))) <= 5
-            THEN gm.title || ' — ' || TRIM(json_extract(g.metadata, '$.author'))
-            ELSE gm.title
-          END
+          title = ${TITLE_RELABEL_CASE_SQL}
         FROM games gm
         WHERE g.game_id = gm.id
           AND TRIM(gm.title) != ''
@@ -215,6 +234,10 @@ const migration_v5: Migration = {
         metadata = json_remove(metadata, '$.original_title')
       WHERE json_extract(metadata, '$.original_title') IS NOT NULL
     `);
+    db.exec('DROP TRIGGER IF EXISTS games_fts_delete');
+    db.exec('DROP TRIGGER IF EXISTS games_fts_update');
+    db.exec('DROP TRIGGER IF EXISTS games_fts_insert');
+    db.exec('DROP TABLE IF EXISTS games_fts');
     db.exec('DROP TABLE IF EXISTS guides_fts_meta_vocab');
     db.exec('DROP TABLE IF EXISTS chunks_fts_vocab');
     db.exec('DROP TRIGGER IF EXISTS chunks_fts_delete');
@@ -233,37 +256,8 @@ const migration_v5: Migration = {
   },
 };
 
-const migration_v6: Migration = {
-  version: 6,
-  up: (db: Database.Database) => {
-    console.log('[Migrations] Applying games_fts virtual table...');
-
-    // Create the FTS5 table + triggers, then backfill from `games` in one
-    // transaction. After this point new rows / title updates / deletes flow
-    // through the triggers automatically.
-    const txn = db.transaction(() => {
-      db.exec(GAMES_FTS_DDL.gamesFts);
-      db.exec(GAMES_FTS_DDL.gamesFtsInsert);
-      db.exec(GAMES_FTS_DDL.gamesFtsUpdate);
-      db.exec(GAMES_FTS_DDL.gamesFtsDelete);
-      db.exec(`INSERT INTO games_fts(game_id, title) SELECT id, title FROM games`);
-      db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (6, ${Date.now()})`);
-    });
-    txn();
-
-    console.log('[Migrations] v6 applied');
-  },
-  down: (db: Database.Database) => {
-    db.exec('DROP TRIGGER IF EXISTS games_fts_delete');
-    db.exec('DROP TRIGGER IF EXISTS games_fts_update');
-    db.exec('DROP TRIGGER IF EXISTS games_fts_insert');
-    db.exec('DROP TABLE IF EXISTS games_fts');
-    db.exec('DELETE FROM schema_version WHERE version = 6');
-  },
-};
-
 // All migrations in order
-export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5, migration_v6];
+export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5];
 
 // Get current schema version from database
 export function getCurrentVersion(db: Database.Database): number {

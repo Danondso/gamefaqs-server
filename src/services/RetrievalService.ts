@@ -100,7 +100,7 @@ const CHUNK_TOKEN_BUDGET = 5;
 // Maximum DF for a chunk-FTS token to count as "rare". Tokens above this
 // threshold get dropped from the chunk-FTS query, since BM25 ranking over
 // millions of candidate chunks dominates wall-clock latency. Per-token DF
-// is read from the fts5vocab virtual table created in migration v9.
+// is read from the fts5vocab virtual table created in migration v5.
 const CHUNK_RARE_DF_FRACTION = 0.05;
 const CHUNK_RARE_DF_MIN = 5000;
 // Game-match RRF weight. rrfK=10 means rank-0 contributes 1/11 ≈ 0.091 per
@@ -407,6 +407,8 @@ export class RetrievalService {
   // would otherwise dominate BM25 ranking and crowd out genuine game-name
   // matches. Returns a (possibly empty) subset of `tokens` ordered by ascending
   // DF — rarest first. Capped at TITLE_TOKEN_BUDGET to keep the OR query small.
+  // DF lookup goes through guides_fts_meta_vocab (created in migration v5),
+  // which is O(log n) per token vs O(n) for `guides_fts_meta MATCH ?`.
   private filterToRareTitleTokens(tokens: string[]): string[] {
     if (tokens.length === 0) return [];
     const total = this.totalTitlesIndexed();
@@ -416,14 +418,15 @@ export class RetrievalService {
     const dfs: { token: string; df: number }[] = [];
     for (const token of tokens) {
       try {
-        const row = this.db.query<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM guides_fts_meta WHERE guides_fts_meta MATCH ?`,
-          [`"${token}"`]
+        const row = this.db.query<{ doc: number }>(
+          `SELECT doc FROM guides_fts_meta_vocab WHERE term = ?`,
+          [token.toLowerCase()]
         )[0];
-        const df = row?.n ?? 0;
+        const df = row?.doc ?? 0;
         if (df > 0 && df <= threshold) dfs.push({ token, df });
       } catch {
-        // Malformed token (shouldn't happen post-sanitize) — skip.
+        // Vocab table missing (pre-v5 DB) — skip rarity filtering for this
+        // token so we don't silently degrade recall.
       }
     }
     dfs.sort((a, b) => a.df - b.df);
@@ -431,11 +434,11 @@ export class RetrievalService {
   }
 
   // Chunk-FTS rarity filter. Same shape as filterToRareTitleTokens but reads
-  // DF from the fts5vocab over chunks_fts (created in migration v9), which
+  // DF from the fts5vocab over chunks_fts (created in migration v5), which
   // is O(log n) per token vs O(n) for `chunks_fts MATCH ?`. Tokens above the
   // rarity threshold are dropped; the survivors are sorted by ascending DF
   // and capped at CHUNK_TOKEN_BUDGET. Falls back to "all tokens, no filter"
-  // if the vocab table is unavailable (older DBs that haven't run v9).
+  // if the vocab table is unavailable (older DBs that haven't run v5).
   private filterToRareChunkTokens(tokens: string[]): string[] {
     if (tokens.length === 0) return tokens;
     const total = this.totalChunksIndexed();
@@ -456,7 +459,7 @@ export class RetrievalService {
         // rarity threshold. Drop only tokens that are demonstrably common.
         if (df <= threshold) dfs.push({ token, df });
       } catch {
-        // Vocab table doesn't exist (pre-v9 DB) — bail out and keep all tokens
+        // Vocab table doesn't exist (pre-v5 DB) — bail out and keep all tokens
         // so we don't silently degrade recall.
         vocabAvailable = false;
         break;
@@ -558,7 +561,7 @@ export class RetrievalService {
       );
       return rows.map(r => r.game_id);
     } catch {
-      // games_fts may not exist (pre-v6 DB) — silently fall back to no match.
+      // games_fts may not exist (pre-v5 DB) — silently fall back to no match.
       return [];
     }
   }

@@ -90,7 +90,7 @@ When the server starts for the first time with an empty database:
 
 **Total time:** 20-40 minutes depending on system performance
 
-**Subsequent startups:** Instant (<5 seconds) - database persists. Migrations run automatically; upgrading an existing DB to schema v5 will relabel guide titles in-place to `Game Name` or `Game Name — Author` (the previous content-extracted titles often picked up ASCII banners or bylines). The original parsed title is preserved on each row under `metadata.original_title`. Schema v6 adds the `games_fts` virtual table that the answer endpoint uses for direct game-name lookup.
+**Subsequent startups:** Instant (<5 seconds) - database persists. Migrations run automatically; upgrading an existing DB to schema v5 will relabel guide titles in-place to `Game Name` or `Game Name — Author` (the previous content-extracted titles often picked up ASCII banners or bylines). The original parsed title is preserved on each row under `metadata.original_title`. Schema v5 also adds the `games_fts` virtual table that the answer endpoint uses for direct game-name lookup.
 
 ### Guide title format
 
@@ -208,6 +208,10 @@ export ADMIN_TOKEN=$(uuidgen)
 # Or with Node
 node -e "console.log(require('crypto').randomUUID())"
 ```
+
+### `/api/guides/answer` exposure
+
+`ADMIN_TOKEN` only gates `/api/admin/*`. `POST /api/guides/answer` is unauthenticated and triggers Ollama embedding + synthesis per request — both are GPU/CPU-expensive. The built-in sliding-window limiter (`ANSWER_RATE_LIMIT`, default 10/min/IP) is the only protection. Do **not** put this endpoint on the open internet without a reverse-proxy auth layer (basic auth, OAuth, or IP allowlist); a small botnet trivially exhausts per-IP limits and runs your Ollama bill / saturates the GPU. Same applies to MCP remote mode, which proxies through this endpoint.
 
 ## Performance Notes
 

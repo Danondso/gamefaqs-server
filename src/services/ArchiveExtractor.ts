@@ -113,13 +113,20 @@ class ArchiveExtractor {
   }
 
   /**
-   * Extract ZIP archive using yauzl (streaming-focused)
+   * Extract ZIP archive using yauzl (streaming-focused). Per-entry failures
+   * (read errors, write errors, path-traversal rejections) are counted and
+   * surfaced to the caller; an outer extraction with non-zero failures still
+   * resolves but the count is logged so the operator knows the output is
+   * incomplete. The outer ZIP comes from a configurable URL, so we explicitly
+   * reject entries whose resolved path escapes outputDir (zip-slip).
    */
   private extractZipArchive(zipPath: string, outputDir: string): Promise<string[]> {
     return new Promise((resolve, reject) => {
       console.log('[ZIP] Reading ZIP file:', zipPath);
 
       const sevenZipArchives: string[] = [];
+      let entryFailures = 0;
+      const outputDirAbs = path.resolve(outputDir);
 
       yauzl.open(zipPath, { lazyEntries: true }, (err: Error | null, zipfile?: ZipFile) => {
         if (err) {
@@ -151,7 +158,16 @@ class ArchiveExtractor {
             return;
           }
 
-          const fullPath = path.join(outputDir, relativePath);
+          // Zip-slip guard: refuse entries whose resolved destination escapes
+          // outputDir. Defends against a hostile or accidentally-malformed
+          // archive writing to arbitrary filesystem paths.
+          const fullPath = path.resolve(outputDirAbs, relativePath);
+          if (fullPath !== outputDirAbs && !fullPath.startsWith(outputDirAbs + path.sep)) {
+            console.warn('[ZIP] Refusing path-traversing entry:', relativePath);
+            entryFailures++;
+            zipfile.readEntry();
+            return;
+          }
           const dirname = path.dirname(fullPath);
 
           // Create directory if needed
@@ -162,11 +178,13 @@ class ArchiveExtractor {
           zipfile.openReadStream(entry, (err: Error | null, readStream?: NodeJS.ReadableStream) => {
             if (err) {
               console.error('[ZIP] Error reading entry:', relativePath, err);
+              entryFailures++;
               zipfile.readEntry();
               return;
             }
 
             if (!readStream) {
+              entryFailures++;
               zipfile.readEntry();
               return;
             }
@@ -182,13 +200,23 @@ class ArchiveExtractor {
 
             writeStream.on('error', (err: Error) => {
               console.error('[ZIP] Error writing file:', relativePath, err);
+              entryFailures++;
               zipfile.readEntry();
             });
           });
         });
 
         zipfile.on('end', () => {
-          console.log('[ZIP] ZIP extraction complete. Extracted', sevenZipArchives.length, '7z archives');
+          if (entryFailures > 0) {
+            console.warn(
+              `[ZIP] Extraction complete with ${entryFailures} per-entry failure(s); extracted ${sevenZipArchives.length} 7z archive(s)`
+            );
+            this.updateProgress({
+              error: `${entryFailures} ZIP entry/entries failed; output may be incomplete`,
+            });
+          } else {
+            console.log('[ZIP] ZIP extraction complete. Extracted', sevenZipArchives.length, '7z archives');
+          }
           resolve(sevenZipArchives);
         });
 

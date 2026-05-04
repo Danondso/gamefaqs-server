@@ -26,7 +26,7 @@ export function composeGuideTitle(
   return `${game} — ${cleaned}`;
 }
 
-function cleanAuthor(author: string | undefined): string | null {
+export function cleanAuthor(author: string | undefined): string | null {
   if (!author) return null;
   // Strip trailing runs of separator chars (the parser regex sometimes pulls in
   // ASCII-banner dashes/asterisks/equals after the actual author name).
