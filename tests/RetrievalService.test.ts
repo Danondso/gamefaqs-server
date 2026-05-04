@@ -4,6 +4,8 @@ import type { IDatabase } from '../src/interfaces/IDatabase';
 import {
   RetrievalService,
   sanitizeFtsQuery,
+  extractGameMatchTokens,
+  numeralAliasVariants,
   type FtsHit,
   type TitleHit,
   type VectorHit,
@@ -481,5 +483,54 @@ describe('sanitizeFtsQuery', () => {
   it('preserves unicode letters and digits', () => {
     expect(sanitizeFtsQuery('Pokémon Red')).toBe('"Pokémon" OR "Red"');
     expect(sanitizeFtsQuery('FF7 boss 99')).toBe('"FF7" OR "boss" OR "99"');
+  });
+});
+
+describe('extractGameMatchTokens', () => {
+  it('lowercases and preserves order', () => {
+    expect(extractGameMatchTokens('How do I beat Sephiroth in Final Fantasy VII?'))
+      .toEqual(['how', 'do', 'i', 'beat', 'sephiroth', 'in', 'final', 'fantasy', 'vii']);
+  });
+
+  it('keeps stopwords (game names contain "the", "of")', () => {
+    // Unlike extractFtsTokens, we need "the" / "of" for phrases like
+    // "Legend of Zelda" or "Symphony of the Night" to match.
+    expect(extractGameMatchTokens('Symphony of the Night'))
+      .toEqual(['symphony', 'of', 'the', 'night']);
+  });
+
+  it('splits punctuation into spaces (apostrophes, hyphens)', () => {
+    expect(extractGameMatchTokens("Who's the first enemy in FFX?"))
+      .toEqual(['who', 's', 'the', 'first', 'enemy', 'in', 'ffx']);
+  });
+});
+
+describe('numeralAliasVariants', () => {
+  it('returns the original alone when no numerals present', () => {
+    expect(numeralAliasVariants(['final', 'fantasy', 'tactics']))
+      .toEqual([['final', 'fantasy', 'tactics']]);
+  });
+
+  it('produces both arabic and roman variants for one numeric token', () => {
+    const variants = numeralAliasVariants(['diablo', '2']);
+    expect(variants).toContainEqual(['diablo', '2']);
+    expect(variants).toContainEqual(['diablo', 'ii']);
+    expect(variants.length).toBe(2);
+  });
+
+  it('round-trips roman → arabic', () => {
+    const variants = numeralAliasVariants(['final', 'fantasy', 'vii']);
+    expect(variants).toContainEqual(['final', 'fantasy', 'vii']);
+    expect(variants).toContainEqual(['final', 'fantasy', '7']);
+  });
+
+  it('handles two numeric tokens (cartesian)', () => {
+    const variants = numeralAliasVariants(['ff', 'x', '2']);
+    // Original + 3 numeral combinations = 4 total
+    expect(variants.length).toBe(4);
+    expect(variants).toContainEqual(['ff', 'x', '2']);
+    expect(variants).toContainEqual(['ff', '10', '2']);
+    expect(variants).toContainEqual(['ff', 'x', 'ii']);
+    expect(variants).toContainEqual(['ff', '10', 'ii']);
   });
 });

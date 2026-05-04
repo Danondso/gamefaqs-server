@@ -1,7 +1,7 @@
 // SQLite database schema definitions
 // Ported from gamefaqs-reader mobile app
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 export const CREATE_TABLES = {
   guides: `
@@ -150,6 +150,47 @@ export const CREATE_INDEXES = {
 // file (see `AnnIndex`), not in SQLite. The chunks_fts table backs BM25
 // retrieval; chunks_fts_vocab (created in migration v5 alongside the FTS
 // table) supports rare-token filtering.
+// FTS5 over `games.title` for direct game-name lookup at retrieval time.
+// Used by RetrievalService.extractGameCandidates to convert "<aspect> in
+// <Game Name>" questions into the matching game_id, then to a guide-id set
+// that gets a strong RRF boost — sidestepping the rare-token-filter issue
+// where action verbs like "beat", "elite" outrank actual game-name tokens.
+//
+// Default tokenizer (porter unicode61) splits on whitespace + punctuation,
+// so a phrase query for `"final fantasy x"` will NOT match `Final Fantasy XI`
+// (token `x` ≠ token `xi`). That word-boundary behavior is the whole point
+// — it's what plain `LIKE '%final fantasy x%'` can't give us.
+export const GAMES_FTS_DDL = {
+  gamesFts: `
+    CREATE VIRTUAL TABLE IF NOT EXISTS games_fts USING fts5(
+      game_id UNINDEXED,
+      title,
+      tokenize = 'porter unicode61'
+    );
+  `,
+
+  gamesFtsInsert: `
+    CREATE TRIGGER IF NOT EXISTS games_fts_insert AFTER INSERT ON games
+    BEGIN
+      INSERT INTO games_fts(game_id, title) VALUES (new.id, new.title);
+    END;
+  `,
+
+  gamesFtsUpdate: `
+    CREATE TRIGGER IF NOT EXISTS games_fts_update AFTER UPDATE OF title ON games
+    BEGIN
+      UPDATE games_fts SET title = new.title WHERE game_id = new.id;
+    END;
+  `,
+
+  gamesFtsDelete: `
+    CREATE TRIGGER IF NOT EXISTS games_fts_delete AFTER DELETE ON games
+    BEGIN
+      DELETE FROM games_fts WHERE game_id = old.id;
+    END;
+  `,
+};
+
 export const RAG_DDL = {
   chunksFts: `
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(

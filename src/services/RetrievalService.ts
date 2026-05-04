@@ -12,9 +12,16 @@
 //      surface guides for the named game even when the chunk content doesn't
 //      repeat the game's name (e.g. a Diablo 2 mechanics chunk that doesn't
 //      say "Diablo" itself).
-//   4. Reciprocal-rank fusion: each chunk's score = Σ_source 1/(rrfK + rank).
+//   4. Game-match boost: phrase-match question n-grams against games_fts —
+//      if the question explicitly names a game ("Pokemon Red", "Final
+//      Fantasy X", "Diablo 2"), pull all chunks for that game's guides and
+//      enter them at rank 0 with a stronger RRF weight than title-FTS. This
+//      sidesteps the title-FTS rare-token-filter pathology where game-name
+//      tokens like `pokemon` (df ~600) get dropped in favor of action verbs
+//      like `beat` (df ~40), causing title-FTS to surface the wrong games.
+//   5. Reciprocal-rank fusion: each chunk's score = Σ_source 1/(rrfK + rank).
 //      Chunks present in multiple lists sum their contributions. Sort desc, take topK.
-//   5. Hydrate to Citation[] in one round trip.
+//   6. Hydrate to Citation[] in one round trip.
 
 import { performance } from 'perf_hooks';
 import type { IDatabase } from '../interfaces/IDatabase';
@@ -55,6 +62,9 @@ export interface TitleHit {
 export type VectorSearchFn = (queryVector: Float32Array, k: number) => VectorHit[];
 export type FtsSearchFn = (query: string, limit: number) => FtsHit[];
 export type TitleSearchFn = (query: string, limit: number) => TitleHit[];
+// Returns the matched game_ids for a question. An empty result means "no
+// game name detected"; consumers fall back to title-FTS / vec / chunk-FTS.
+export type GameMatchFn = (question: string) => string[];
 
 export interface RetrievalServiceOpts {
   db: IDatabase;
@@ -63,10 +73,12 @@ export interface RetrievalServiceOpts {
   vecLimit?: number;
   titleLimit?: number;
   rrfK?: number;
+  gameMatchRrfK?: number;
   // Test seams. If omitted, defaults wrap the ANN index / FTS5 SQL.
   vectorSearch?: VectorSearchFn;
   ftsSearch?: FtsSearchFn;
   titleSearch?: TitleSearchFn;
+  gameMatch?: GameMatchFn;
 }
 
 const EXCERPT_CHARS = 300;
@@ -91,6 +103,30 @@ const CHUNK_TOKEN_BUDGET = 5;
 // is read from the fts5vocab virtual table created in migration v9.
 const CHUNK_RARE_DF_FRACTION = 0.05;
 const CHUNK_RARE_DF_MIN = 5000;
+// Game-match RRF weight. rrfK=10 means rank-0 contributes 1/11 ≈ 0.091 per
+// chunk vs title-FTS's 1/61 ≈ 0.016 — about 5× the boost. A confirmed
+// game-name match should outrank coincidental title hits on action verbs,
+// but vec / chunk-FTS still run unfiltered so a wrong game extraction can
+// be rescued.
+const GAME_MATCH_RRF_K = 10;
+// N-gram window for game-name extraction. 5 covers "metal gear solid 2 sons"
+// without admitting many genuine nonsense matches; 2 catches short titles
+// like "Portal", "Tetris". Longer matches are tried first so "Final Fantasy
+// X 2 HD" beats "Final Fantasy X".
+const GAME_MATCH_NGRAM_MAX = 5;
+const GAME_MATCH_NGRAM_MIN = 2;
+// Roman ↔ Arabic numeral pairs we substitute when generating n-gram phrase
+// candidates. Covers the common range for game-installment numbers; the
+// games table uses both forms inconsistently ("Diablo II" but "Final
+// Fantasy X 2"), so we try both.
+const NUMERAL_ALIASES: Record<string, string> = {
+  '1': 'i', '2': 'ii', '3': 'iii', '4': 'iv', '5': 'v',
+  '6': 'vi', '7': 'vii', '8': 'viii', '9': 'ix', '10': 'x',
+  '11': 'xi', '12': 'xii', '13': 'xiii', '14': 'xiv', '15': 'xv',
+  'i': '1', 'ii': '2', 'iii': '3', 'iv': '4', 'v': '5',
+  'vi': '6', 'vii': '7', 'viii': '8', 'ix': '9', 'x': '10',
+  'xi': '11', 'xii': '12', 'xiii': '13', 'xiv': '14', 'xv': '15',
+};
 
 interface ChunkRow {
   id: string;
@@ -109,9 +145,11 @@ export class RetrievalService {
   private readonly vecLimit: number;
   private readonly titleLimit: number;
   private readonly rrfK: number;
+  private readonly gameMatchRrfK: number;
   private readonly vectorSearch: VectorSearchFn;
   private readonly ftsSearch: FtsSearchFn;
   private readonly titleSearch: TitleSearchFn;
+  private readonly gameMatch: GameMatchFn;
 
   constructor(opts: RetrievalServiceOpts) {
     this.db = opts.db;
@@ -122,9 +160,11 @@ export class RetrievalService {
     // (potentially many) chunks, and a too-wide title-match list dominates RRF.
     this.titleLimit = opts.titleLimit ?? 10;
     this.rrfK = opts.rrfK ?? 60;
+    this.gameMatchRrfK = opts.gameMatchRrfK ?? GAME_MATCH_RRF_K;
     this.vectorSearch = opts.vectorSearch ?? this.defaultVectorSearch.bind(this);
     this.ftsSearch = opts.ftsSearch ?? this.defaultFtsSearch.bind(this);
     this.titleSearch = opts.titleSearch ?? this.defaultTitleSearch.bind(this);
+    this.gameMatch = opts.gameMatch ?? this.defaultGameMatch.bind(this);
   }
 
   async retrieve(question: string, filters: RetrievalFilters, topK: number): Promise<Citation[]> {
@@ -198,20 +238,37 @@ export class RetrievalService {
     // get the same boost; vec/FTS pick the best chunk within.
     const titleChunkHits = this.expandTitleHitsToChunks(titleHits);
 
+    // Game-match: phrase-match question n-grams against games_fts. If a
+    // game name is detected, all chunks of that game's guides enter RRF at
+    // rank 0 with a stronger weight than title-FTS. Failures here are silent;
+    // a missing games_fts table (older DB) just returns [] and falls through.
+    let gameMatchChunkIds: string[] = [];
+    try {
+      const matchedGameIds = this.gameMatch(question);
+      if (matchedGameIds.length > 0) {
+        gameMatchChunkIds = this.expandGameMatchToChunks(matchedGameIds);
+      }
+    } catch (err: any) {
+      console.warn('[Retrieval] game-match failed:', err.message);
+    }
+
     // Apply filters before fusion so RRF rank reflects post-filter ordering.
     let filteredVec: VectorHit[] = vecHits;
     let filteredFts: FtsHit[] = ftsHits;
     let filteredTitle: { chunk_id: string; rank: number }[] = titleChunkHits;
+    let filteredGameMatch: string[] = gameMatchChunkIds;
     if (hasFilters) {
       const candidateIds = new Set([
         ...vecHits.map(h => h.chunk_id),
         ...ftsHits.map(h => h.chunk_id),
         ...titleChunkHits.map(h => h.chunk_id),
+        ...gameMatchChunkIds,
       ]);
       const allowed = this.filterChunkIds(candidateIds, filters);
       filteredVec = vecHits.filter(h => allowed.has(h.chunk_id));
       filteredFts = ftsHits.filter(h => allowed.has(h.chunk_id));
       filteredTitle = titleChunkHits.filter(h => allowed.has(h.chunk_id));
+      filteredGameMatch = gameMatchChunkIds.filter(id => allowed.has(id));
     }
 
     // RRF fusion. Rank within each list (1-indexed) is its position after
@@ -228,6 +285,11 @@ export class RetrievalService {
     // the same boost.
     filteredTitle.forEach(h => {
       scores.set(h.chunk_id, (scores.get(h.chunk_id) ?? 0) + 1 / (this.rrfK + (h.rank + 1)));
+    });
+    // Game-match: every chunk of a matched-game guide enters at rank 1 with
+    // gameMatchRrfK (smaller k = bigger boost than title-FTS).
+    filteredGameMatch.forEach(chunkId => {
+      scores.set(chunkId, (scores.get(chunkId) ?? 0) + 1 / (this.gameMatchRrfK + 1));
     });
 
     const ranked = Array.from(scores.entries())
@@ -443,6 +505,76 @@ export class RetrievalService {
     return this.cachedTitleTotal;
   }
 
+  // Default game-match: tokenize the question, generate n-grams from longest
+  // to shortest, try each (and its numeral-aliased variants) as a phrase
+  // query against games_fts. Returns matching game_ids on first hit, or [].
+  //
+  // Why first-hit-wins: the longer phrase is the more specific match. If
+  // "final fantasy x 2" matches, we don't also want "final fantasy x" (a
+  // different game) muddying the result. If only "diablo 2" matches, that's
+  // the intended target.
+  private defaultGameMatch(question: string): string[] {
+    const tokens = extractGameMatchTokens(question);
+    if (tokens.length < GAME_MATCH_NGRAM_MIN) return [];
+
+    // Walk longest-first; within each length, RIGHT-to-left. The shape of
+    // these questions ("how do I beat X in <Game Name>?") puts the game
+    // name near the end, so rightmost positions are tried first. Without
+    // this, an incidental shorter match earlier in the question can preempt
+    // the real game name. For each window, also try numeral-aliased forms
+    // (Diablo 2 ↔ Diablo II).
+    //
+    // Skip n-grams whose first OR last token is a stopword: phrases like
+    // "the best", "the temple", "in the" phrase-match incidentally inside
+    // longer game titles ("Best of the Best Championship Karate" contains
+    // "the best") and produce false-positive game matches for ambiguous
+    // questions. Real game names have non-stopword endpoints.
+    for (let n = Math.min(GAME_MATCH_NGRAM_MAX, tokens.length); n >= GAME_MATCH_NGRAM_MIN; n--) {
+      for (let start = tokens.length - n; start >= 0; start--) {
+        const ngramTokens = tokens.slice(start, start + n);
+        if (STOPWORDS.has(ngramTokens[0]) || STOPWORDS.has(ngramTokens[ngramTokens.length - 1])) {
+          continue;
+        }
+        const variants = numeralAliasVariants(ngramTokens);
+        for (const variant of variants) {
+          const ids = this.queryGamesFtsPhrase(variant);
+          if (ids.length > 0) return ids;
+        }
+      }
+    }
+    return [];
+  }
+
+  private queryGamesFtsPhrase(phraseTokens: string[]): string[] {
+    // FTS5 phrase syntax: "word1 word2 word3" matches contiguous tokens.
+    // Quote individual tokens to neutralize accidental keyword shape, then
+    // wrap the whole thing as a phrase.
+    const phrase = phraseTokens.map(t => t.replace(/"/g, '')).join(' ');
+    if (!phrase) return [];
+    try {
+      const rows = this.db.query<{ game_id: string }>(
+        `SELECT game_id FROM games_fts WHERE games_fts MATCH ? ORDER BY rank LIMIT 16`,
+        [`"${phrase}"`]
+      );
+      return rows.map(r => r.game_id);
+    } catch {
+      // games_fts may not exist (pre-v6 DB) — silently fall back to no match.
+      return [];
+    }
+  }
+
+  private expandGameMatchToChunks(gameIds: string[]): string[] {
+    if (gameIds.length === 0) return [];
+    const placeholders = gameIds.map(() => '?').join(',');
+    const rows = this.db.query<{ id: string }>(
+      `SELECT c.id FROM chunks c
+       JOIN guides g ON g.id = c.guide_id
+       WHERE g.game_id IN (${placeholders})`,
+      gameIds
+    );
+    return rows.map(r => r.id);
+  }
+
   // Each TitleHit carries a guide-level rank; we emit one entry per chunk in
   // that guide so RRF can blend with the chunk-level vec/FTS sources. Chunks
   // inherit the guide's rank (i.e. all chunks of guide-rank 0 score the same
@@ -514,6 +646,54 @@ export function extractFtsTokens(question: string): string[] {
     tokens.push(raw);
   }
   return tokens;
+}
+
+// Tokenize a question for game-name n-gram matching. Differs from
+// extractFtsTokens: we keep stopwords (game names contain "the", "of",
+// "and") and preserve original token order — n-gram windows depend on
+// adjacency. Also lowercased so phrase queries are case-insensitive.
+//
+// Exported for tests.
+export function extractGameMatchTokens(question: string): string[] {
+  const cleaned = question.replace(/[^\p{L}\p{N}\s]/gu, ' ');
+  const tokens: string[] = [];
+  for (const raw of cleaned.split(/\s+/)) {
+    if (!raw) continue;
+    const upper = raw.toUpperCase();
+    if (upper === 'AND' || upper === 'OR' || upper === 'NOT' || upper === 'NEAR') continue;
+    tokens.push(raw.toLowerCase());
+  }
+  return tokens;
+}
+
+// For a token sequence, generate phrase variants substituting numerals
+// (Arabic ↔ Roman) at each numeric position. Returns the original first,
+// then variants. Caps the explosion at 8 variants — covers up to three
+// numeric tokens in one phrase, which is more than any real game title.
+//
+// Exported for tests.
+export function numeralAliasVariants(tokens: string[]): string[][] {
+  const positions: number[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (NUMERAL_ALIASES[tokens[i]] !== undefined) positions.push(i);
+  }
+  if (positions.length === 0) return [tokens];
+  const variants: string[][] = [tokens.slice()];
+  // Each numeric position can flip independently — generate up to 2^k
+  // combinations (capped). For 0 numerals: just the original. For 1: 2
+  // variants. For 2: 4. For 3+: 8.
+  const cap = Math.min(8, 1 << positions.length);
+  for (let mask = 1; mask < cap; mask++) {
+    const variant = tokens.slice();
+    for (let bit = 0; bit < positions.length; bit++) {
+      if ((mask >> bit) & 1) {
+        const pos = positions[bit];
+        variant[pos] = NUMERAL_ALIASES[tokens[pos]];
+      }
+    }
+    variants.push(variant);
+  }
+  return variants;
 }
 
 export function tokensToFtsQuery(tokens: string[]): string {

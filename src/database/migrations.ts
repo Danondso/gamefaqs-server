@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH, FILTER_LOOKUP_TRIGGERS, RAG_DDL, SCHEMA_VERSION } from './schema';
+import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH, FILTER_LOOKUP_TRIGGERS, RAG_DDL, GAMES_FTS_DDL, SCHEMA_VERSION } from './schema';
 
 export interface Migration {
   version: number;
@@ -233,8 +233,37 @@ const migration_v5: Migration = {
   },
 };
 
+const migration_v6: Migration = {
+  version: 6,
+  up: (db: Database.Database) => {
+    console.log('[Migrations] Applying games_fts virtual table...');
+
+    // Create the FTS5 table + triggers, then backfill from `games` in one
+    // transaction. After this point new rows / title updates / deletes flow
+    // through the triggers automatically.
+    const txn = db.transaction(() => {
+      db.exec(GAMES_FTS_DDL.gamesFts);
+      db.exec(GAMES_FTS_DDL.gamesFtsInsert);
+      db.exec(GAMES_FTS_DDL.gamesFtsUpdate);
+      db.exec(GAMES_FTS_DDL.gamesFtsDelete);
+      db.exec(`INSERT INTO games_fts(game_id, title) SELECT id, title FROM games`);
+      db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (6, ${Date.now()})`);
+    });
+    txn();
+
+    console.log('[Migrations] v6 applied');
+  },
+  down: (db: Database.Database) => {
+    db.exec('DROP TRIGGER IF EXISTS games_fts_delete');
+    db.exec('DROP TRIGGER IF EXISTS games_fts_update');
+    db.exec('DROP TRIGGER IF EXISTS games_fts_insert');
+    db.exec('DROP TABLE IF EXISTS games_fts');
+    db.exec('DELETE FROM schema_version WHERE version = 6');
+  },
+};
+
 // All migrations in order
-export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5];
+export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5, migration_v6];
 
 // Get current schema version from database
 export function getCurrentVersion(db: Database.Database): number {
