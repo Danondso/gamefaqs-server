@@ -40,6 +40,10 @@ const TEST_TIMEOUT_MS = parseInt(process.env.RAG_BENCH_TEST_TIMEOUT_MS ?? String
 // regression signal. Default 0.55 is "current state minus a few points of
 // expected per-run noise" — tighten or loosen via env.
 const RECALL_FLOOR = parseFloat(process.env.RAG_BENCH_RECALL_FLOOR ?? '0.55');
+// Pacing: small delay before each /answer fetch so the bench plays nicely with
+// the production rate limiter. Cheaper than chewing through retry budgets on
+// 429s. Default 1s; set 0 to disable.
+const INTER_QUESTION_DELAY_MS = parseInt(process.env.RAG_BENCH_DELAY_MS ?? '5000', 10);
 
 // Baseline records per-question expected pass/fail, so a question that passed
 // last run but fails now is flagged loudly even if aggregate recall is fine.
@@ -47,6 +51,19 @@ const RECALL_FLOOR = parseFloat(process.env.RAG_BENCH_RECALL_FLOOR ?? '0.55');
 const BASELINE_PATH = path.resolve(__dirname, 'baselines', 'rag-accuracy.json');
 const WRITE_BASELINE = process.env.RAG_BENCH_WRITE_BASELINE === '1';
 const BASELINE_SCHEMA_VERSION = 1;
+
+// Snapshot mode: write a time-series record (separate from the canonical
+// baseline) to a path of the caller's choosing. Used for tracking how recall
+// evolves as the index grows. Optional metadata env vars are stamped into the
+// record so the history file stands alone without needing log correlation.
+const HISTORY_PATH = process.env.RAG_BENCH_HISTORY_PATH;
+const HISTORY_LABEL = process.env.RAG_BENCH_HISTORY_LABEL;
+const HISTORY_GUIDES = process.env.RAG_BENCH_GUIDES_INDEXED;
+const HISTORY_EMBEDDINGS = process.env.RAG_BENCH_EMBEDDINGS_COUNT;
+// Either flag puts us in "snapshot mode": per-question hard assertions are
+// skipped and the regression-vs-baseline check is suppressed. The point of a
+// snapshot is to capture current state, not to fail on it.
+const SNAPSHOT_MODE = WRITE_BASELINE || !!HISTORY_PATH;
 
 interface BaselineQuestion {
   question: string;
@@ -83,24 +100,32 @@ interface BenchQuestion {
 // common case (word boundaries around alphanumerics); roman-numeral matches
 // like \bvii\b correctly do NOT match \bviii\b because the trailing I is a
 // word char.
-const RX_FF7 = /\b(final\s+fantasy\s+(vii|7)|ff\s*7)\b/i;
-const RX_FF6 = /\b(final\s+fantasy\s+(vi|6|iii)|ff\s*6)\b/i;
-const RX_FFX = /\b(final\s+fantasy\s+(x|10)|ffx)\b/i;
+// Compilation/anthology titles that bundle a specific installment count as a
+// hit for that installment's question. e.g. "Metal Gear Solid the Legacy
+// Collection" contains MGS2, so it satisfies an Otacon-password question.
+// We don't try to enumerate every possible compilation — only ones we've seen
+// in the live corpus that genuinely contain the target game.
+const RX_FF7 = /\b(final\s+fantasy\s+(vii|7)|ff\s*7|advent\s+children)\b/i;
+const RX_FF6 = /\b(final\s+fantasy\s+(vi|6|iii|anthology)|ff\s*6)\b/i;
+const RX_FFX = /\b(final\s+fantasy\s+(x|10|x\s*\/\s*x-2|x\s+hd)|ffx)\b/i;
 const RX_OOT = /\b(ocarina\s+of\s+time|oot)\b/i;
 const RX_BOTW = /\b(breath\s+of\s+the\s+wild|botw)\b/i;
 const RX_WW = /\b(wind\s+waker|tww)\b/i;
-const RX_SOTN = /\b(symphony\s+of\s+the\s+night|sotn)\b/i;
+const RX_SOTN = /\b(symphony\s+of\s+the\s+night|sotn|castlevania\s+requiem|castlevania\s+anniversary\s+collection)\b/i;
 const RX_RE4 = /\b(resident\s+evil\s+4|biohazard\s+4|re\s*4)\b/i;
 const RX_RE_SERIES = /\b(resident\s+evil|biohazard)\b/i;
-const RX_MGS2 = /\b(metal\s+gear\s+solid\s+2|sons\s+of\s+liberty|mgs\s*2)\b/i;
+// MGS2 lives in: Sons of Liberty (PS2/Xbox), HD Collection, Legacy Collection,
+// Master Collection. All are valid sources for Otacon's password.
+const RX_MGS2 = /\b(metal\s+gear\s+solid\s+(2|(?:the\s+)?(?:legacy|hd|master)\s+collection)|sons\s+of\s+liberty|mgs\s*2)\b/i;
 const RX_MGS_SERIES = /\b(metal\s+gear|mgs)\b/i;
 // Pokemon Red/Blue — exclude Rescue Team and other "Red <Word>" titles by
 // requiring the next word to be Blue/Yellow/version/edition or end-of-title.
 const RX_POKEMON_RB = /\bpok[eé]mon\s+(red|blue)\s*(?:$|\b(?:and|\/|version|edition|blue|red|yellow)\b)/i;
 const RX_POKEMON_SERIES = /\bpok[eé]mon\b/i;
-const RX_SM64 = /\b(super\s+mario\s+64|mario\s+64|sm64)\b/i;
+const RX_SM64 = /\b(super\s+mario\s+64|mario\s+64|sm64|super\s+mario\s+3d\s+all-?stars)\b/i;
 const RX_CHRONO = /\bchrono\s+trigger\b/i;
-const RX_D2 = /\b(diablo\s+(2|ii)|d2)\b/i;
+// D2 lives in Battle Chest (D1+D2+LoD) and Resurrected. Both ship the same level cap.
+const RX_D2 = /\b(diablo\s+(2|ii|battle\s+chest)|d2|diablo\s+ii\s+resurrected)\b/i;
 const RX_DIABLO_SERIES = /\bdiablo\b/i;
 const RX_GTA_SA = /\b(san\s+andreas|gta\s*:?\s*sa)\b/i;
 const RX_PORTAL = /\bportal\b/i;
@@ -517,6 +542,9 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
   it.each(QUESTIONS)(
     '$question',
     async (q) => {
+      if (INTER_QUESTION_DELAY_MS > 0) {
+        await new Promise((r) => setTimeout(r, INTER_QUESTION_DELAY_MS));
+      }
       const ans = await ask(q.question);
       const recall = checkRecall(ans.citations, q);
       const keywordHits = checkAnswerKeywords(ans.answer, q.expectedAnswerKeywords);
@@ -539,9 +567,9 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
       };
       results.push(result);
 
-      // When writing a fresh baseline, don't fail on individual misses — the
-      // baseline IS the current state. Summary still writes the file.
-      if (WRITE_BASELINE) return;
+      // Snapshot modes (write baseline / write history) skip per-question
+      // assertions — the file IS the record of current state.
+      if (SNAPSHOT_MODE) return;
 
       // Regression-aware contract:
       //   - No baseline: enforce the kind contract on every question (strict).
@@ -616,28 +644,63 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
     console.warn('===========================================\n');
     /* eslint-enable no-console */
 
-    // Baseline mode: write the file and skip drift assertions. The just-written
+    const questionRecords = results.map((r) => ({
+      question: r.question,
+      kind: r.kind,
+      passed: r.passed,
+      matched_title: r.matchedTitle,
+      no_answer: r.noAnswer,
+      keyword_hits: r.answerKeywordHits,
+    }));
+
+    // Canonical-baseline mode: overwrite the regression boundary. Just-written
     // baseline matches itself; comparing would be tautological.
     if (WRITE_BASELINE) {
       const data: Baseline = {
         schema_version: BASELINE_SCHEMA_VERSION,
         generated_at: new Date().toISOString(),
         recall_floor_used: RECALL_FLOOR,
-        questions: results.map((r) => ({
-          question: r.question,
-          kind: r.kind,
-          passed: r.passed,
-          matched_title: r.matchedTitle,
-          no_answer: r.noAnswer,
-          keyword_hits: r.answerKeywordHits,
-        })),
+        questions: questionRecords,
       };
       fs.mkdirSync(path.dirname(BASELINE_PATH), { recursive: true });
       fs.writeFileSync(BASELINE_PATH, JSON.stringify(data, null, 2) + '\n');
       // eslint-disable-next-line no-console
       console.warn(`[baseline] wrote ${results.length} entries → ${BASELINE_PATH}`);
-      return;
     }
+
+    // History mode: append a time-series record. Independent of the canonical
+    // baseline so growing-index runs don't churn the regression boundary.
+    if (HISTORY_PATH) {
+      const snapshot = {
+        schema_version: BASELINE_SCHEMA_VERSION,
+        generated_at: new Date().toISOString(),
+        label: HISTORY_LABEL ?? null,
+        guides_indexed: HISTORY_GUIDES ? parseInt(HISTORY_GUIDES, 10) : null,
+        embeddings_count: HISTORY_EMBEDDINGS ? parseInt(HISTORY_EMBEDDINGS, 10) : null,
+        recall_at_k: {
+          k: TOP_K,
+          hits: recallHits,
+          total: recallable.length,
+          rate: recallRate,
+          ci_low: lo,
+          ci_high: hi,
+        },
+        trick: { passes: trickPasses, total: tricks.length },
+        unanswerable: { passes: unanswerablePasses, total: unanswerables.length },
+        timing_ms: {
+          avg_total: Math.round(avgTotal),
+          avg_retrieve: Math.round(avgRetrieve),
+          avg_synth: Math.round(avgSynth),
+        },
+        questions: questionRecords,
+      };
+      fs.mkdirSync(path.dirname(HISTORY_PATH), { recursive: true });
+      fs.writeFileSync(HISTORY_PATH, JSON.stringify(snapshot, null, 2) + '\n');
+      // eslint-disable-next-line no-console
+      console.warn(`[history] wrote snapshot → ${HISTORY_PATH}`);
+    }
+
+    if (SNAPSHOT_MODE) return;
 
     // Compare current run to baseline. Regressions = was passing, now failing.
     if (baseline) {
