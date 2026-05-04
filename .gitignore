@@ -36,6 +36,6 @@ Thumbs.db
 
 **/coverage/
 
-# ANN bake-off scratch (large binary dumps + candidate indexes; see TODO.md)
+# Scratch and one-off experiment outputs (large binary dumps, side indexes)
 /scratch/
 *.usearch
