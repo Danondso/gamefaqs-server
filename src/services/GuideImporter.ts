@@ -12,7 +12,7 @@ const BATCH_SIZE = 100;
  * Build the canonical guide title: `${gameName}` or `${gameName} — ${author}`.
  * Falls back to the parsed title when no clean game name is available. The
  * author check filters obvious junk (the upstream regex sometimes grabs whole
- * sentences) — must stay in sync with the SQL CASE in migration v7.
+ * sentences) — must stay in sync with the SQL CASE in the migration v5 title relabel.
  */
 export function composeGuideTitle(
   gameName: string | undefined,

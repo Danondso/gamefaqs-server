@@ -1,7 +1,7 @@
 // SQLite database schema definitions
 // Ported from gamefaqs-reader mobile app
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 5;
 
 export const CREATE_TABLES = {
   guides: `
@@ -148,8 +148,8 @@ export const CREATE_INDEXES = {
 
 // DDL for the RAG chunk-level search infrastructure. Vectors live in the ANN
 // file (see `AnnIndex`), not in SQLite. The chunks_fts table backs BM25
-// retrieval; chunks_fts_vocab is created by migration v8 for rare-token
-// filtering.
+// retrieval; chunks_fts_vocab (created in migration v5 alongside the FTS
+// table) supports rare-token filtering.
 export const RAG_DDL = {
   chunksFts: `
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(

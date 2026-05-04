@@ -68,7 +68,7 @@ export interface GuideMetadata {
   author?: string;
   version?: string;
   tags?: string[];
-  // Pre-relabel title (set by migration v7 / importer when we override title with games.title)
+  // Pre-relabel title (set by migration v5 / importer when we override title with games.title)
   original_title?: string;
   // AI-generated fields
   summary?: string;

@@ -137,89 +137,48 @@ const migration_v4: Migration = {
   },
 };
 
-// Migration v5: Add chunks table and FTS5 chunk index for RAG. Vectors live
-// in the ANN file (`${dbPath}.ann`, see AnnIndex), not in SQLite.
+// Migration v5: RAG bring-up + title relabel. Adds chunks table, chunk FTS,
+// fts5vocab views for rare-token filtering, the indexer's per-guide
+// checkpoint column with its composite cursor index, and relabels existing
+// guide titles to the linked game's name (the parser's content-extracted
+// title is unreliable — banners and bylines slip through). Vectors live in
+// the ANN file (`${dbPath}.ann`, see AnnIndex), not in SQLite.
+//
+// The relabel UPDATE is idempotent: rows with metadata.original_title set
+// are skipped, so this is safe on fresh DBs (zero rows match) and on
+// already-relabeled DBs.
 const migration_v5: Migration = {
   version: 5,
   up: (db: Database.Database) => {
-    console.log('[Migrations] Adding RAG schema (chunks + FTS)...');
+    console.log('[Migrations] Applying RAG schema + title relabel...');
 
-    // guides.indexed_at: per-guide checkpoint for the indexer
     db.exec('ALTER TABLE guides ADD COLUMN indexed_at INTEGER');
-    db.exec('CREATE INDEX IF NOT EXISTS idx_guides_indexed_at ON guides(indexed_at)');
+    // Composite (indexed_at, id) serves both `indexed_at IS NULL` filtering
+    // and the indexer's `ORDER BY id` cursor — no separate single-column
+    // index needed.
+    db.exec('CREATE INDEX IF NOT EXISTS idx_guides_indexed_at_id ON guides(indexed_at, id)');
 
     db.exec(CREATE_TABLES.chunks);
     db.exec(CREATE_INDEXES.chunks_guide_id);
 
-    // FTS5 is built into SQLite — always available
     db.exec(RAG_DDL.chunksFts);
     db.exec(RAG_DDL.chunksFtsInsert);
     db.exec(RAG_DDL.chunksFtsDelete);
 
-    db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (5, ${Date.now()})`);
-    console.log('[Migrations] RAG schema applied');
-  },
-  down: (db: Database.Database) => {
-    db.exec('DROP TRIGGER IF EXISTS chunks_fts_delete');
-    db.exec('DROP TRIGGER IF EXISTS chunks_fts_insert');
-    db.exec('DROP TABLE IF EXISTS chunks_fts');
-    db.exec('DROP INDEX IF EXISTS idx_chunks_guide_id');
-    db.exec('DROP TABLE IF EXISTS chunks');
-    db.exec('DROP INDEX IF EXISTS idx_guides_indexed_at');
-    // SQLite 3.35+ supports DROP COLUMN
-    try {
-      db.exec('ALTER TABLE guides DROP COLUMN indexed_at');
-    } catch (err: any) {
-      console.warn('[Migrations] Could not drop column indexed_at (older SQLite?):', err.message);
-    }
-    db.exec('DELETE FROM schema_version WHERE version = 5');
-  },
-};
+    // fts5vocab virtual tables expose (term, doc, col) over an FTS5 index
+    // in `row` mode — per-term distinct-document counts in O(log n). Used
+    // by RetrievalService.filterToRareChunkTokens to drop common tokens
+    // before BM25 scoring.
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_vocab USING fts5vocab(chunks_fts, row)`);
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS guides_fts_meta_vocab USING fts5vocab(guides_fts_meta, row)`);
 
-// Migration v6: Composite index (indexed_at, id) for the indexer's prefetch
-// cursor. The previous single-column idx_guides_indexed_at served IS NULL
-// filters but couldn't satisfy ORDER BY id, so the indexer was building a
-// TEMP B-TREE over every unindexed row per SELECT.
-const migration_v6: Migration = {
-  version: 6,
-  up: (db: Database.Database) => {
-    console.log('[Migrations] Adding composite index idx_guides_indexed_at_id (may take a few seconds on large DBs)...');
-    db.exec('CREATE INDEX IF NOT EXISTS idx_guides_indexed_at_id ON guides(indexed_at, id)');
-    db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (6, ${Date.now()})`);
-    console.log('[Migrations] v6 applied');
-  },
-  down: (db: Database.Database) => {
-    db.exec('DROP INDEX IF EXISTS idx_guides_indexed_at_id');
-    db.exec('DELETE FROM schema_version WHERE version = 6');
-  },
-};
-
-// Migration v7: Relabel guide titles to use the linked game's name (composed
-// with metadata.author when present). The content-extraction heuristic was
-// returning ASCII-art banners and stray byline lines as titles for the bulk
-// of the archive — see backfill numbers (88% no-overlap with games.title).
-// This relabel is idempotent: rows that already have metadata.original_title
-// are skipped, so re-runs are safe.
-const migration_v7: Migration = {
-  version: 7,
-  up: (db: Database.Database) => {
-    console.log('[Migrations] Relabeling guide titles to prefer games.title (this may take a minute)...');
-
-    const before = db.prepare(`
-      SELECT COUNT(*) AS n FROM guides g
-      JOIN games gm ON g.game_id = gm.id
-      WHERE TRIM(gm.title) != ''
-        AND json_extract(g.metadata, '$.original_title') IS NULL
-    `).get() as { n: number };
-    console.log(`[Migrations] v7: ${before.n} guides eligible for relabel`);
-
+    // Title relabel: stash original title in metadata.original_title AND set
+    // the new title in one shot, so the guides_fts_meta_update trigger fires
+    // exactly once per row.
+    // The author filter must stay in sync with isLikelyAuthor() in
+    // GuideImporter.ts: length 2..60, no newlines / | / = / >, and ≤ 5 spaces
+    // (the parser sometimes grabs whole sentences).
     const txn = db.transaction(() => {
-      // Single UPDATE: stash old title in metadata.original_title AND set the
-      // new title in one shot, so the guides_fts_meta_update trigger fires
-      // exactly once per row instead of twice.
-      // The author filter must stay in sync with isLikelyAuthor() in
-      // GuideImporter.ts: length 2..60, no newlines / | / = / >, and ≤ 5
-      // spaces (the parser sometimes grabs whole sentences).
       db.exec(`
         UPDATE guides AS g
         SET
@@ -241,15 +200,14 @@ const migration_v7: Migration = {
           AND TRIM(gm.title) != ''
           AND json_extract(g.metadata, '$.original_title') IS NULL
       `);
-      db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (7, ${Date.now()})`);
+      db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (5, ${Date.now()})`);
     });
     txn();
 
-    console.log('[Migrations] v7 applied');
+    console.log('[Migrations] v5 applied');
   },
   down: (db: Database.Database) => {
-    // Restore each guide's original title from metadata.original_title where present.
-    console.log('[Migrations] Reverting v7: restoring original titles from metadata...');
+    // Restore titles from metadata.original_title where present.
     db.exec(`
       UPDATE guides
       SET
@@ -257,39 +215,26 @@ const migration_v7: Migration = {
         metadata = json_remove(metadata, '$.original_title')
       WHERE json_extract(metadata, '$.original_title') IS NOT NULL
     `);
-    db.exec('DELETE FROM schema_version WHERE version = 7');
-  },
-};
-
-// Migration v8: vocab views over chunks_fts and guides_fts_meta. fts5vocab is
-// a read-only virtual table that exposes (term, doc, col) over an FTS5 index;
-// `?,row` mode gives per-term distinct-document counts in O(log n) — much
-// faster than `SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?`,
-// which is itself a full FTS5 search.
-//
-// Used by RetrievalService.filterToRareChunkTokens to drop common tokens
-// before BM25 scoring. Chunk-FTS was the dominant retrieval latency
-// contributor (94% of total wall time, p95 ~3.9s) before this filter; the
-// rare-token cutoff brings it in line with the title-FTS source which
-// already uses this trick.
-const migration_v8: Migration = {
-  version: 8,
-  up: (db: Database.Database) => {
-    console.log('[Migrations] Creating fts5vocab virtual tables for rare-token filtering...');
-    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_vocab USING fts5vocab(chunks_fts, row)`);
-    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS guides_fts_meta_vocab USING fts5vocab(guides_fts_meta, row)`);
-    db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (8, ${Date.now()})`);
-    console.log('[Migrations] v8 applied');
-  },
-  down: (db: Database.Database) => {
-    db.exec('DROP TABLE IF EXISTS chunks_fts_vocab');
     db.exec('DROP TABLE IF EXISTS guides_fts_meta_vocab');
-    db.exec('DELETE FROM schema_version WHERE version = 8');
+    db.exec('DROP TABLE IF EXISTS chunks_fts_vocab');
+    db.exec('DROP TRIGGER IF EXISTS chunks_fts_delete');
+    db.exec('DROP TRIGGER IF EXISTS chunks_fts_insert');
+    db.exec('DROP TABLE IF EXISTS chunks_fts');
+    db.exec('DROP INDEX IF EXISTS idx_chunks_guide_id');
+    db.exec('DROP TABLE IF EXISTS chunks');
+    db.exec('DROP INDEX IF EXISTS idx_guides_indexed_at_id');
+    // SQLite 3.35+ supports DROP COLUMN
+    try {
+      db.exec('ALTER TABLE guides DROP COLUMN indexed_at');
+    } catch (err: any) {
+      console.warn('[Migrations] Could not drop column indexed_at (older SQLite?):', err.message);
+    }
+    db.exec('DELETE FROM schema_version WHERE version = 5');
   },
 };
 
 // All migrations in order
-export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5, migration_v6, migration_v7, migration_v8];
+export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5];
 
 // Get current schema version from database
 export function getCurrentVersion(db: Database.Database): number {
