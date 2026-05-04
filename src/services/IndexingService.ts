@@ -10,6 +10,7 @@ import { config } from '../config';
 import DefaultDatabase from '../database/database';
 import type { IDatabase } from '../interfaces/IDatabase';
 import type { Guide } from '../types';
+import { AnnIndex } from './AnnIndex';
 import { chunkGuide } from './Chunker';
 import { EmbeddingService } from './EmbeddingService';
 
@@ -443,5 +444,152 @@ export class IndexingService {
         console.error('[Indexing] listener error:', err);
       }
     }
+  }
+
+  // Vector-only rebuild. Reads existing chunks.content from SQLite (no DELETE,
+  // no UPDATE, no chunk re-creation), embeds via the configured EmbeddingService,
+  // and writes vectors to a separate AnnIndex file at `opts.annPath`. Used for
+  // model-swap A/B and full re-embed cutover — see DEBUG-ann-recall.md and
+  // /home/dublin/.claude/plans/make-a-plan-to-parallel-hartmanis.md.
+  //
+  // The side ANN never replaces this.db.annIndex; the live retrieval path is
+  // unaffected until an operator manually swaps the file. SQL state is only
+  // read, so this is safe to run while the live server is up.
+  async rebuildVectors(opts: {
+    annPath: string;
+    dim: number;
+    guideIds?: string[];
+    saveEveryGuides?: number;
+    onProgress?: (p: { processedGuides: number; totalGuides: number; processedChunks: number; failedGuides: number; currentGuide?: string }) => void;
+  }): Promise<{ processedGuides: number; processedChunks: number; failedGuides: number; durationMs: number; annPath: string }> {
+    const saveEvery = opts.saveEveryGuides ?? config.annSaveEveryGuides;
+    const startedAt = Date.now();
+
+    if (this.embeddings.getDim() !== opts.dim) {
+      throw new Error(
+        `rebuildVectors: EmbeddingService dim=${this.embeddings.getDim()} but opts.dim=${opts.dim}. ` +
+        `Construct the EmbeddingService with the same dim as the target ANN.`
+      );
+    }
+
+    // Open the side ANN. The dim guard in AnnIndex.load() throws if the file
+    // exists with a different dim — desired behavior, prevents clobbering.
+    const ann = new AnnIndex({
+      dim: opts.dim,
+      file: opts.annPath,
+      M: config.annM,
+      efAdd: config.annEfAdd,
+      efSearch: config.annEfSearch,
+    });
+    if (ann.load()) {
+      console.log(`[VecRebuild] resumed ${opts.annPath} (size=${ann.size().toLocaleString()})`);
+    } else {
+      console.log(`[VecRebuild] starting fresh at ${opts.annPath}`);
+    }
+
+    // Resolve the guide list. Filter mode = explicit subset (Stage 1 / Stage 2);
+    // unfiltered = every guide that has chunks (Stage 3).
+    let guideIds: string[];
+    if (opts.guideIds) {
+      guideIds = [...opts.guideIds];
+    } else {
+      // indexed_at IS NOT NULL is the indexer's "has chunks" marker. Order by
+      // id so resumes are deterministic.
+      const rows = this.db.query<{ id: string }>(
+        'SELECT id FROM guides WHERE indexed_at IS NOT NULL ORDER BY id'
+      );
+      guideIds = rows.map(r => r.id);
+    }
+    const totalGuides = guideIds.length;
+    console.log(`[VecRebuild] ${totalGuides.toLocaleString()} guides to embed`);
+
+    const selectChunksStmt = this.db.getDb().prepare(
+      'SELECT rowid AS rowid, content AS content FROM chunks WHERE guide_id = ? ORDER BY chunk_index'
+    );
+    const selectGuideTitleStmt = this.db.getDb().prepare(
+      'SELECT title FROM guides WHERE id = ?'
+    );
+
+    let processedGuides = 0;
+    let processedChunks = 0;
+    let failedGuides = 0;
+    let guidesSinceSave = 0;
+
+    const isUnreachable = (err: any): boolean => {
+      if (!err) return false;
+      const msg = String(err.message ?? err);
+      if (msg.includes('fetch failed') || msg === 'TIMEOUT') return true;
+      const code = err.cause?.code ?? err.code;
+      return code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'ECONNRESET' || code === 'ETIMEDOUT' || code === 'EAI_AGAIN';
+    };
+
+    for (const guideId of guideIds) {
+      const chunks = selectChunksStmt.all(guideId) as Array<{ rowid: number; content: string }>;
+      if (chunks.length === 0) {
+        processedGuides++;
+        continue;
+      }
+
+      const titleRow = selectGuideTitleStmt.get(guideId) as { title?: string } | undefined;
+
+      try {
+        const vectors = await this.embeddings.embedBatch(chunks.map(c => c.content), 4);
+        for (let i = 0; i < chunks.length; i++) {
+          // If a rowid is already in the index (resume after crash), USearch
+          // throws on duplicate add. Remove first; cheap when not present.
+          try { ann.remove(chunks[i].rowid); } catch (_e) { /* not present */ }
+          ann.add(chunks[i].rowid, vectors[i]);
+        }
+        processedChunks += chunks.length;
+        processedGuides++;
+        guidesSinceSave++;
+
+        if (guidesSinceSave >= saveEvery) {
+          if (ann.saveIfDirty()) {
+            console.log(`[VecRebuild] saved ANN (${processedGuides}/${totalGuides} guides, ${processedChunks.toLocaleString()} chunks)`);
+          }
+          guidesSinceSave = 0;
+        }
+      } catch (err: any) {
+        if (isUnreachable(err)) {
+          // Save what we have so resume is meaningful, then bail.
+          try { ann.saveIfDirty(); } catch (_e) { /* best-effort */ }
+          throw new Error(
+            `Embedding service unreachable (${err.message ?? err}). Saved partial ANN at ${opts.annPath}; rerun to resume from this guide.`
+          );
+        }
+        failedGuides++;
+        processedGuides++;
+        console.error(`[VecRebuild] guide ${guideId} (${titleRow?.title ?? '?'}) failed: ${err.message ?? err}`);
+      }
+
+      if (opts.onProgress) {
+        opts.onProgress({
+          processedGuides,
+          totalGuides,
+          processedChunks,
+          failedGuides,
+          currentGuide: titleRow?.title,
+        });
+      }
+    }
+
+    // Final flush so the file on disk reflects the complete run.
+    try {
+      if (ann.saveIfDirty()) {
+        console.log(`[VecRebuild] final save (${processedGuides} guides, ${processedChunks.toLocaleString()} chunks)`);
+      }
+    } catch (err: any) {
+      console.error(`[VecRebuild] final save failed: ${err.message}`);
+      throw err;
+    }
+
+    return {
+      processedGuides,
+      processedChunks,
+      failedGuides,
+      durationMs: Date.now() - startedAt,
+      annPath: opts.annPath,
+    };
   }
 }

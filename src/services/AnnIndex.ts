@@ -70,9 +70,23 @@ export class AnnIndex {
   // missing (caller starts with an empty index — fine, the indexer will
   // populate). Throws on a *corrupt* file — operators should delete it and
   // let the indexer re-embed any chunks lacking ANN entries on next run.
+  //
+  // Also guards against dim mismatch: USearch's load() silently adopts the
+  // file's dim, but every subsequent add()/search() in this process expects
+  // the constructor's dim. Pointing a 1024d EMBEDDING_DIM run at a 768d file
+  // would either corrupt subsequent writes or throw deep inside USearch with
+  // no actionable context. Catch it up front.
   load(): boolean {
     if (!fs.existsSync(this.file)) return false;
     this.idx.load(this.file);
+    const fileDim = Number(this.idx.dimensions());
+    if (fileDim !== this.opts.dim) {
+      throw new Error(
+        `AnnIndex.load: ${this.file} has dim=${fileDim} but EMBEDDING_DIM=${this.opts.dim}. ` +
+        `Use a different ANN_INDEX_PATH for the new model, or delete the existing file ` +
+        `if you intend to rebuild. (Live and side-index files cannot share a path.)`
+      );
+    }
     this.dirty = false;
     return true;
   }
