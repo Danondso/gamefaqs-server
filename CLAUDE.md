@@ -60,7 +60,7 @@ Current `SCHEMA_VERSION` is **5**. Schema changes require a new migration in `sr
 
 ### ANN index
 
-The vector store is **USearch HNSW i8** in a single file at `${dbPath}.ann` (override with `ANN_INDEX_PATH`). Keyed by `chunks.rowid`. Picked over libSQL DiskANN and other candidates by the bake-off in `tests/benchmarks/ann-bakeoff/` (recall@8 84-87% end-to-end, p95 vec latency 7ms, 3.3 GB on disk for 3.7M vectors).
+The vector store is **USearch HNSW i8** in a single file at `${dbPath}.ann` (override with `ANN_INDEX_PATH`). Keyed by `chunks.rowid`. Picked over libSQL DiskANN and other candidates in a one-time bake-off (recall@8 84-87% end-to-end, p95 vec latency 7ms, 3.3 GB on disk for 3.7M vectors).
 
 On startup, `DatabaseService.openAnnIndex()`:
 1. Loads `${dbPath}.ann` if it exists (~3s for a 3 GB file).
