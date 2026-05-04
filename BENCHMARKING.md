@@ -123,7 +123,7 @@ matched "Beat Down Fists of Vengeance", "First Queen", etc.
 
 ### 3. Solution: games_fts virtual table + n-gram phrase matching
 
-Migration v6 adds a `games_fts` FTS5 virtual table over `games.title` with
+Migration v5 adds a `games_fts` FTS5 virtual table over `games.title` with
 default `porter unicode61` tokenization. Default tokenizer's word boundaries
 cleanly distinguish `final fantasy x` from `final fantasy xi` (token `x` ≠
 token `xi`) — something plain `LIKE '%final fantasy x%'` can't do.
@@ -267,6 +267,41 @@ Implementation surface:
 
 This is the largest perceived-latency win available without changing the
 model.
+
+### Larger embedder for the ambiguous-question ceiling
+
+Current embedder is `nomic-embed-text` (768d). Specific recall is at 100%
+post-game-match, so embeddings have nothing left to fix there — but the 4/6
+ambiguous ceiling has held flat across every milestone, every model swap, and
+every retrieval-side change. These questions don't name a game; the only
+discriminating signal is semantic similarity in the vector space, where the
+current embedder doesn't separate "Where do I find the Master Key?" from
+chunks in unrelated games (Hellboy, Ogre Battle, Doctor Lautrec).
+
+Candidate: **bge-m3** (1024d, already pulled per `ollama list`). Generally
+ranks above nomic on MTEB retrieval benchmarks.
+
+Implementation surface:
+- `EMBEDDING_MODEL=bge-m3` + `EMBEDDING_DIM=1024` env (or `config.ts` default).
+- Full re-embed: existing `scripts/rag-reembed-bge-m3.sh` already wraps the
+  side-ANN re-embed flow to `${DB_PATH}.ann.new`. Multi-hour run on the 50k
+  corpus (~2.6M chunks).
+- Cutover: stop server, swap `gamefaqs.db.ann` for `.ann.new`, restart. The
+  `AnnIndex.load()` dim guard from commit `2da5239` will catch dim mismatches
+  loudly instead of producing silent garbage.
+- Bench: write a new baseline post-swap (`RAG_BENCH_WRITE_BASELINE=1`).
+  Specific should hold at 100%; the win or loss shows up in ambiguous (4/6
+  → ?) and possibly retrieve latency (1024d vs 768d vec compare is ~33%
+  more work per probe).
+
+Costs:
+- ANN file ~33% larger (currently ~3 GB → ~4 GB).
+- Vec query ~25-30% slower per probe (small absolute increase since vec is
+  ~150ms of the 240ms warm retrieve).
+- One-time multi-hour re-embed.
+
+Worth running once we want to push past 4/6 ambiguous, or as a precondition
+for any future precision work that depends on tighter semantic separation.
 
 ## Environment variables
 
