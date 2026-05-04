@@ -245,6 +245,29 @@ RAG_BENCH=1 RAG_BENCH_WRITE_BASELINE=1 \
 After writing, eyeball the diff vs the previous baseline. Per-question
 flips should match what you intended.
 
+## Open work
+
+### Answer streaming
+
+The `/api/guides/answer` endpoint currently waits for the full synth output
+before responding (~1s p50, up to ~3s on long answers). Switching to a
+streaming response (Server-Sent Events or chunked transfer) would cut
+perceived latency dramatically — first-token-time on qwen3:0.6b/1.7b is
+~200-300ms, vs the ~1s a user waits today.
+
+Implementation surface:
+- `OllamaService.synthesize` (or wherever the chat call lives) → use the
+  `stream: true` Ollama endpoint and yield tokens.
+- `/api/guides/answer` route → hold the response open and write each token
+  as an SSE event or a chunk.
+- Client (mobile app + admin panel) → consume the stream incrementally.
+- Bench: a streaming response changes `timing_ms.synthesize` semantics
+  (TTFT vs total). Track both — TTFT is the user-perceived metric, total
+  is the resource cost.
+
+This is the largest perceived-latency win available without changing the
+model.
+
 ## Environment variables
 
 | Var | Default | Purpose |

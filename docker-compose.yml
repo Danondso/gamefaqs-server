@@ -46,7 +46,7 @@ services:
       - OLLAMA_MODEL=qwen3:latest # set your default here, you can change it in the admin panel
       # RAG synthesis: model that takes retrieved chunks + question and writes
       # the answer. Override via SYNTHESIS_MODEL.
-      - SYNTHESIS_MODEL=qwen3:1.7b
+      - SYNTHESIS_MODEL=qwen3:0.6b
     healthcheck:
       test:
         [
