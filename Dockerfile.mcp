@@ -20,7 +20,7 @@ RUN npm run mcp:bundle
 FROM node:20-bookworm-slim AS deps
 WORKDIR /app
 COPY package.json ./package.json.full
-RUN node -e "const p=require('./package.json.full');require('fs').writeFileSync('./package.json',JSON.stringify({name:'gamefaqs-mcp-deps',version:'0.0.0',private:true,dependencies:{'better-sqlite3':p.dependencies['better-sqlite3']}}))" \
+RUN node -e "const fs=require('fs');const p=JSON.parse(fs.readFileSync('./package.json.full','utf8'));fs.writeFileSync('./package.json',JSON.stringify({name:'gamefaqs-mcp-deps',version:'0.0.0',private:true,dependencies:{'better-sqlite3':p.dependencies['better-sqlite3'],'usearch':p.dependencies['usearch']}}))" \
  && rm package.json.full \
  && npm install --omit=dev --no-audit --no-fund --no-package-lock \
  && rm -rf /root/.npm package.json \

@@ -14,7 +14,7 @@
     "docker:run": "docker-compose up",
     "mcp": "ts-node src/mcp-server.ts",
     "mcp:start": "node dist/mcp-server.js",
-    "mcp:bundle": "esbuild src/mcp-server.ts --bundle --platform=node --target=node20 --format=cjs --external:better-sqlite3 --outfile=dist/mcp-server.js",
+    "mcp:bundle": "esbuild src/mcp-server.ts --bundle --platform=node --target=node20 --format=cjs --external:better-sqlite3 --external:usearch --outfile=dist/mcp-server.js",
     "docker:mcp:build": "docker build -f Dockerfile.mcp -t gamefaqs-mcp ."
   },
   "keywords": [],
