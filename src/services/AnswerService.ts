@@ -61,8 +61,14 @@ export class AnswerService {
 
     if (extraction.status === 'ambiguous') {
       const candidates = this.lookupGameTitles(extraction.gameIds);
-      const ask = candidates.length <= 3
-        ? `I found multiple likely games: ${candidates.map(c => c.title).join(', ')}. Which one are you playing?`
+      // Multiple game IDs can share the same display title (platform variants
+      // catalogued separately, e.g. OoT Master Quest with platform=null and
+      // platform=GameCube both titled "...Ocarina of Time Master Quest"). Dedup
+      // for the user-facing prose, but keep all ids in disambiguation_candidates
+      // so a downstream resolver can still pick a specific variant.
+      const distinctTitles = Array.from(new Set(candidates.map(c => c.title)));
+      const ask = distinctTitles.length >= 2 && distinctTitles.length <= 3
+        ? `I found multiple likely games: ${distinctTitles.join(', ')}. Which one are you playing?`
         : 'I found several possible games. Which game and platform do you mean?';
       return {
         answer: ask,
