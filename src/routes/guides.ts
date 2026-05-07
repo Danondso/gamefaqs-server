@@ -125,10 +125,12 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
         // operators can tell which Ollama is down.
         const message = err?.message ?? '';
         if (message.startsWith('Embedding API error') || message.includes('Embedding dim mismatch') || message === 'TIMEOUT') {
+          console.error(`[${new Date().toISOString()}] [Answer] embedding error: ${message}`);
           res.status(503).json({ error: 'Embedding service unavailable' });
           return;
         }
         if (message.startsWith('Synthesis API error')) {
+          console.error(`[${new Date().toISOString()}] [Answer] synthesis error: ${message}`);
           res.status(503).json({ error: 'Synthesis service unavailable' });
           return;
         }

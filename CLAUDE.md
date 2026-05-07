@@ -79,6 +79,10 @@ PORT=3000                    # HTTP port
 DB_PATH=/data/db/gamefaqs.db # SQLite database path (ignored by MCP server in remote mode)
 ADMIN_TOKEN=                 # Optional admin authentication (gates /api/admin/* only)
 OLLAMA_HOST=http://localhost:11434  # Optional AI integration
+EMBEDDING_OLLAMA_HOST=       # Optional — separate Ollama host for embeds (default: OLLAMA_HOST)
+EMBEDDING_MODEL=nomic-embed-text-cpu:latest  # Embed model. Defaults to `nomic-embed-text` in code; docker-compose pins the CPU-flagged tag (num_gpu=0) so it doesn't fight the synthesis model for VRAM. Same blob / 768 dim as the GPU tag, so switching between them does NOT invalidate the ANN index.
+EMBEDDING_DIM=768            # Must match the embedding model. Changing this DOES invalidate the ANN index.
+SYNTHESIS_MODEL=qwen3:30b-a3b-instruct-2507-q4_K_M  # RAG synthesis model
 GAMEFAQS_API_URL=            # Optional — when set, MCP server proxies to this REST API instead of opening local DB
 ANN_INDEX_PATH=              # Optional override for the ANN file location (default `${DB_PATH}.ann`)
 ANN_M=16                     # USearch HNSW connectivity (graph degree)

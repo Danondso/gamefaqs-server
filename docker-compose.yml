@@ -46,6 +46,16 @@ services:
       - OLLAMA_MODEL=qwen3:latest # set your default here, you can change it in the admin panel
       # RAG synthesis — override via SYNTHESIS_MODEL (default: qwen3 30B instruct Q4_K_M).
       - SYNTHESIS_MODEL=${SYNTHESIS_MODEL:-qwen3:30b-a3b-instruct-2507-q4_K_M}
+      # Embed model is pinned to a CPU-only tag (num_gpu=0) so it doesn't fight
+      # the synthesis model for VRAM. Same weights / 768 dim as the GPU tag —
+      # safe to switch without re-indexing.
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text-cpu:latest}
+      # Chunker version — v1 (legacy greedy packer) | v2 (type-aware, emits
+      # content_type/section_heading per chunk). Default v1; set to v2 to
+      # opt newly-indexed guides into the type-aware chunker. Mixed
+      # populations are fine — schema v11 defaults legacy rows to
+      # content_type='prose'. See CHUNKER_DESIGN.md / CHUNK_TEST.md.
+      - CHUNKER_VERSION=${CHUNKER_VERSION:-v1}
       - ANSWER_RATE_LIMIT=40
     healthcheck:
       test:
