@@ -59,17 +59,31 @@ export class GameExtractionService {
     const fts = this.matchGamesFtsTitle(question);
     if (fts.status === 'confident') return fts;
 
-    // Explicit aliases are the right path for abbreviations/nicknames ("ff7",
-    // "sotn", "botw") that don't appear verbatim in game titles.
+    // games_fts ambiguous (multiple specific installments — e.g. MGS2 Substance
+    // vs MGS2 Sons of Liberty) is more specific than any single-token alias
+    // that could substring-match the question. Emit it BEFORE alias matching so
+    // a coarse alias like `metal gear` (NES game) cannot pre-empt the more
+    // specific MGS2 disambiguation hit.
+    if (fts.status === 'ambiguous') return fts;
+
+    // Entities (character / location / item names) are more specific than
+    // single-token aliases. A question containing "Solid Snake" should match
+    // the multi-token entity (→ Metal Gear Solid) rather than the 1-token
+    // alias `snake` (→ standalone Snake mobile game). The over-seeded guard
+    // inside matchEntity already prevents an entity that bulk-seeded across
+    // many spinoffs from over-claiming.
+    const entity = this.matchEntity(normalized);
+    if (entity.status === 'confident') return entity;
+
+    // Explicit aliases catch abbreviations/nicknames ("ff7", "sotn", "botw",
+    // "mgs") that don't appear verbatim in titles or entities. Runs after fts
+    // and entity so it doesn't override more specific signals.
     const explicit = this.matchExplicitAlias(normalized);
     if (explicit.status !== 'unclear') return explicit;
 
-    // games_fts ambiguous is still more reliable than entity matching, so emit
-    // it here rather than letting entities override a multi-game FTS hit.
-    if (fts.status === 'ambiguous') return fts;
-
-    const entity = this.matchEntity(normalized);
-    if (entity.status !== 'unclear') return entity;
+    // Entity ambiguous is the last hint before fallback — better than nothing
+    // when fts found no match and aliases didn't disambiguate.
+    if (entity.status === 'ambiguous') return entity;
 
     if (context.establishedGameId) {
       return { status: 'confident', gameId: context.establishedGameId, confidence: 0.6, reason: 'conversation_context' };
@@ -124,7 +138,19 @@ export class GameExtractionService {
     );
     const matches = rows.filter(r => {
       const alias = normalize(r.alias);
-      return alias.length > 0 && normalizedQuestion.includes(alias);
+      // Aliases under 3 chars are too generic to match safely (`s`, `re`,
+      // `ff` would be ambiguous without numeral context). 3 chars and up
+      // covers `mgs`, `gta`, `kh1`, etc.
+      if (alias.length < 3) return false;
+      // Cheap prefilter — most rows fail here so we don't pay regex cost.
+      if (!normalizedQuestion.includes(alias)) return false;
+      // Whole-word boundary check: prevents alias `aer` from matching
+      // questions containing "aerith" or "aero", and alias `name`
+      // from matching every question containing "what's X's name?".
+      // Without this, naive includes() picks an arbitrary game whose
+      // title fragment happens to be a substring of the question.
+      const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp(`\\b${escaped}\\b`).test(normalizedQuestion);
     });
     if (matches.length === 0) return { status: 'unclear', reason: 'no_alias_match' };
     const byGame = new Map<string, number>();
@@ -145,7 +171,16 @@ export class GameExtractionService {
        LEFT JOIN games g ON g.id = e.game_id
        ORDER BY e.confidence DESC LIMIT 3000`
     );
-    const matched = rows.filter(r => normalizedQuestion.includes(normalize(r.entity)));
+    // Drop rows where EntitySeedService's FTS-share recompute zeroed the
+    // confidence — those games have no chunks containing this entity, so
+    // they shouldn't influence disambiguation. Without this filter, any
+    // entity seeded across many spinoffs/compilations (e.g. "solid snake"
+    // hits 14 MGS-anything games, "sephiroth" hits 4 FF7-anything games)
+    // trips the over-seeded guard below and returns `unclear` even when
+    // a single game has overwhelmingly the strongest FTS evidence.
+    const matched = rows.filter(r =>
+      r.confidence > 0 && normalizedQuestion.includes(normalize(r.entity))
+    );
     if (matched.length === 0) return { status: 'unclear', reason: 'no_entity_match' };
     const unique = matched.filter(r => r.is_unique === 1);
     if (unique.length === 0) {
