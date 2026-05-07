@@ -950,16 +950,39 @@ export class RetrievalService {
         if (STOPWORDS.has(ngramTokens[0]) || STOPWORDS.has(ngramTokens[ngramTokens.length - 1])) {
           continue;
         }
-        const variants = numeralAliasVariants(ngramTokens);
-        for (const variant of variants) {
-          const ids = this.queryGamesFtsPhrase(variant);
-          if (ids.length > 0) {
-            return {
-              ids,
-              phraseTokens: variant,
-              confidence: classifyGameMatchConfidence(tokens, variant),
-            };
+        // Compose abbreviation expansion + numeral aliasing. Order matters:
+        // expand abbreviations first (`gta` → `grand theft auto`), then alias
+        // any numerals in the expanded form (so `mgs 2` → `metal gear solid 2`
+        // → `metal gear solid ii`). Dedup variants — a phrase with no
+        // abbreviations and no numerals would otherwise be tried twice.
+        const seen = new Set<string>();
+        const variants: string[][] = [];
+        for (const expanded of abbreviationVariants(ngramTokens)) {
+          for (const variant of numeralAliasVariants(expanded)) {
+            const key = variant.join(' ');
+            if (seen.has(key)) continue;
+            seen.add(key);
+            variants.push(variant);
           }
+        }
+        for (const variant of variants) {
+          const hits = this.queryGamesFtsPhraseWithTitles(variant);
+          if (hits.length === 0) continue;
+          // 1-gram bare-title demotion (Bug 3): when the phrase is a single
+          // token AND every matched title is just that one token verbatim
+          // (e.g. phrase "snake" matches the standalone game titled "Snake"),
+          // surface as `low` so GameExtractionService falls through to the
+          // alias / entity layers. Without this, the bare 1-gram match wins
+          // and locks retrieval to the wrong game (e.g. "Solid Snake's
+          // father" → standalone "Snake" game instead of MGS).
+          const bareTitleHit =
+            variant.length === 1 &&
+            hits.every(h => normalizeTitleTokens(h.title).join(' ') === variant[0]);
+          return {
+            ids: hits.map(h => h.game_id),
+            phraseTokens: variant,
+            confidence: classifyGameMatchConfidence(tokens, variant, bareTitleHit),
+          };
         }
       }
     }
@@ -967,6 +990,10 @@ export class RetrievalService {
   }
 
   private queryGamesFtsPhrase(phraseTokens: string[]): string[] {
+    return this.queryGamesFtsPhraseWithTitles(phraseTokens).map(r => r.game_id);
+  }
+
+  private queryGamesFtsPhraseWithTitles(phraseTokens: string[]): { game_id: string; title: string }[] {
     // FTS5 phrase syntax: "word1 word2 word3" matches contiguous tokens.
     // Quote individual tokens to neutralize accidental keyword shape, then
     // wrap the whole thing as a phrase.
@@ -986,9 +1013,22 @@ export class RetrievalService {
       // "final fantasy vii" matches "Crisis Core Final Fantasy VII" and
       // "Final Fantasy VII Advent Children" (different games / spinoffs).
       // See RETRIEVAL_DEBUG.md "Step 3" for the live-data analysis.
-      return rows
-        .filter(r => passesTitleBoundaryFilter(cleanedPhrase, r.title))
-        .map(r => r.game_id);
+      const strict = rows.filter(r => passesTitleBoundaryFilter(cleanedPhrase, r.title));
+      if (strict.length > 0) return strict;
+      // Subtitle fallback (Bug fix-1): some series have NO base catalog entry
+      // and are only listed as "<series> <number> <subtitle>" (e.g. "Metal
+      // Gear Solid 2" exists only as "...Substance" / "...Sons of Liberty";
+      // "Metal Gear Solid 3" only as "...Snake Eater"). The strict filter
+      // rejects all of these because the subtitle is not a decoration token.
+      // When strict returns 0 AND the phrase is at least 3 tokens, retry with
+      // a prefix-only match: phrase must occur at title position 0, tail can
+      // be anything. This is safe because if a base entry existed, the strict
+      // filter would have returned it and pre-empted the fallback — so e.g.
+      // "Final Fantasy VII" still does NOT match "...Advent Children".
+      if (cleanedPhrase.length >= 3) {
+        return rows.filter(r => isTitlePrefixMatch(cleanedPhrase, r.title));
+      }
+      return [];
     } catch {
       // games_fts may not exist (pre-v5 DB) — silently fall back to no match.
       return [];
@@ -1051,7 +1091,11 @@ export function detectRetrievalIntent(question: string, hasGameMatch: boolean): 
   return 'ambiguous';
 }
 
-function classifyGameMatchConfidence(questionTokens: string[], phraseTokens: string[]): GameMatchConfidence {
+function classifyGameMatchConfidence(
+  questionTokens: string[],
+  phraseTokens: string[],
+  bareTitleHit = false,
+): GameMatchConfidence {
   if (phraseTokens.length === 0) return 'none';
   if (phraseTokens.length >= 3) return 'high';
   if (phraseTokens.length === 2) return 'medium';
@@ -1059,6 +1103,14 @@ function classifyGameMatchConfidence(questionTokens: string[], phraseTokens: str
   const token = phraseTokens[0];
   if (token.length < MIN_1GRAM_LEN) return 'low';
   if (LOW_SIGNAL_SINGLE_TOKENS.has(token)) return 'low';
+  // 1-gram phrase that matched ONLY a bare-title game (e.g. "snake" → game
+  // titled "Snake"). The matcher is too loose here because any noun-shaped
+  // word that happens to also be a standalone game title would otherwise
+  // win at high/medium confidence and lock retrieval to the wrong game.
+  // Demoting to `low` lets GameExtractionService consult the alias / entity
+  // layers — which after EntitySeedService has run know that "solid snake"
+  // is an MGS character, not the standalone Snake game.
+  if (bareTitleHit) return 'low';
   const idx = questionTokens.indexOf(token);
   if (idx > 0 && CONTEXT_PREPOSITIONS.has(questionTokens[idx - 1])) return 'high';
   return 'medium';
@@ -1164,6 +1216,20 @@ export function passesTitleBoundaryFilter(phraseTokens: string[], title: string)
   return true;
 }
 
+// Prefix-match fallback for the boundary filter. Returns true if the phrase
+// occurs at title position 0 (head is empty), regardless of tail. Used by
+// queryGamesFtsPhraseWithTitles when the strict filter returns 0 hits — see
+// the call site for the safety argument (a base entry would have pre-empted
+// this fallback by passing the strict filter first).
+//
+// Exported for tests.
+export function isTitlePrefixMatch(phraseTokens: string[], title: string): boolean {
+  const strippedTitle = title.replace(/\s*\([^)]*\)/g, '').trim();
+  const titleTokens = normalizeTitleTokens(strippedTitle || title);
+  const phrase = phraseTokens.map(t => t.toLowerCase());
+  return findContiguousTokenMatch(titleTokens, phrase) === 0;
+}
+
 // FTS5 reserves a number of characters and bare keywords. Sanitize a raw user
 // question so it can be passed to MATCH without syntax errors and without
 // accidentally enabling phrase / boolean operators.
@@ -1224,6 +1290,64 @@ export function extractGameMatchTokens(question: string): string[] {
     tokens.push(raw.toLowerCase());
   }
   return tokens;
+}
+
+// For a token sequence, generate phrase variants by expanding each
+// abbreviation token (`gta` → `grand theft auto`, `mgs` → `metal gear solid`).
+// Adjacency rule: only expand when the abbreviation is adjacent to a numeral
+// OR sits at the start/end of the phrase. Without that gate, `re` in casual
+// English ("Re: that question") would falsely expand to "resident evil".
+//
+// Returns the powerset over which abbreviation positions to expand (always
+// includes the original at index 0). Capped at 4 variants — up to 2
+// abbreviations per phrase, which is far more than any real game name.
+//
+// Exported for tests.
+export function abbreviationVariants(tokens: string[]): string[][] {
+  if (tokens.length === 0) return [tokens];
+
+  const isNumeric = (s: string): boolean => NUMERAL_ALIASES[s] !== undefined;
+
+  // Identify abbreviation positions in the ORIGINAL token sequence. These
+  // indices are stable across mask iterations because we always rebuild
+  // from `tokens` rather than from a previously-spliced variant.
+  const positions: number[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    if (!ABBREV_EXPANSIONS[tokens[i]]) continue;
+    const atBoundary = i === 0 || i === tokens.length - 1;
+    const prevNum = i > 0 && isNumeric(tokens[i - 1]);
+    const nextNum = i < tokens.length - 1 && isNumeric(tokens[i + 1]);
+    if (atBoundary || prevNum || nextNum) positions.push(i);
+  }
+  if (positions.length === 0) return [tokens];
+
+  // Cap the powerset at 4 (= 2^2) so the variant explosion stays bounded
+  // under composition with numeralAliasVariants (which can already 8x).
+  const cap = Math.min(4, 1 << positions.length);
+  const variants: string[][] = [];
+  for (let mask = 0; mask < cap; mask++) {
+    // Rebuild from the ORIGINAL tokens. Walk left to right; whenever we
+    // hit an abbreviation position whose mask bit is set, push the
+    // expansion instead of the original token. Index drift across the
+    // splice is invisible to this loop because we read from `tokens` (the
+    // pre-splice array), not from a variant under construction.
+    const variant: string[] = [];
+    let bitIndex = 0;
+    for (let i = 0; i < tokens.length; i++) {
+      if (bitIndex < positions.length && positions[bitIndex] === i) {
+        if ((mask >> bitIndex) & 1) {
+          variant.push(...ABBREV_EXPANSIONS[tokens[i]]);
+        } else {
+          variant.push(tokens[i]);
+        }
+        bitIndex++;
+      } else {
+        variant.push(tokens[i]);
+      }
+    }
+    variants.push(variant);
+  }
+  return variants;
 }
 
 // For a token sequence, generate phrase variants substituting numerals

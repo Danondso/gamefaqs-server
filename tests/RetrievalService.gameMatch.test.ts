@@ -9,7 +9,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createTestDatabase } from './helpers/testDb';
 import type { IDatabase } from '../src/interfaces/IDatabase';
-import { RetrievalService, passesTitleBoundaryFilter, detectRetrievalIntent } from '../src/services/RetrievalService';
+import { RetrievalService, passesTitleBoundaryFilter, isTitlePrefixMatch, detectRetrievalIntent } from '../src/services/RetrievalService';
 import type { EmbeddingService } from '../src/services/EmbeddingService';
 
 const mockEmbedder = {
@@ -234,6 +234,27 @@ describe('passesTitleBoundaryFilter (unit)', () => {
 
   it('phrase absent from title rejects (defensive)', () => {
     expect(passesTitleBoundaryFilter(['portal'], 'Diablo')).toBe(false);
+  });
+});
+
+describe('isTitlePrefixMatch (unit)', () => {
+  it('phrase at position 0 with arbitrary tail passes', () => {
+    expect(isTitlePrefixMatch(['metal', 'gear', 'solid', '2'], 'Metal Gear Solid 2 Substance')).toBe(true);
+    expect(isTitlePrefixMatch(['metal', 'gear', 'solid', '2'], 'Metal Gear Solid 2 Sons of Liberty')).toBe(true);
+    expect(isTitlePrefixMatch(['metal', 'gear', 'solid', '3'], 'Metal Gear Solid 3 Snake Eater')).toBe(true);
+  });
+
+  it('phrase NOT at position 0 rejects (head must be empty)', () => {
+    expect(isTitlePrefixMatch(['final', 'fantasy', 'vii'], 'Crisis Core Final Fantasy VII')).toBe(false);
+    expect(isTitlePrefixMatch(['ocarina', 'of', 'time'], 'The Legend of Zelda: Ocarina of Time')).toBe(false);
+  });
+
+  it('parenthetical platform suffix is stripped before matching', () => {
+    expect(isTitlePrefixMatch(['metal', 'gear', 'solid', '2'], 'Metal Gear Solid 2 (PS2)')).toBe(true);
+  });
+
+  it('phrase absent from title rejects', () => {
+    expect(isTitlePrefixMatch(['portal'], 'Diablo')).toBe(false);
   });
 });
 
