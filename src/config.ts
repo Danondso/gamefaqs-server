@@ -38,7 +38,7 @@ export const config = {
   embeddingModel: process.env.EMBEDDING_MODEL || 'nomic-embed-text',
   embeddingDim: parseInt(process.env.EMBEDDING_DIM || '768', 10),
   synthesisHost: process.env.SYNTHESIS_OLLAMA_HOST || process.env.OLLAMA_HOST || 'http://localhost:11434',
-  synthesisModel: process.env.SYNTHESIS_MODEL || 'qwen2.5:7b-instruct',
+  synthesisModel: process.env.SYNTHESIS_MODEL || 'qwen3:30b-a3b-instruct-2507-q4_K_M',
   // Default 400 tokens is intentionally conservative: nomic-embed-text's hard
   // context limit is 2048 tokens, and our chars/4 estimate undercounts BPE for
   // content with lots of CRLF, abbreviations, or stat tables (real density can
@@ -46,6 +46,13 @@ export const config = {
   // content stays under 2048 after chunking + overlap.
   chunkSizeTokens: parseInt(process.env.CHUNK_SIZE_TOKENS || '400', 10),
   chunkOverlapTokens: parseInt(process.env.CHUNK_OVERLAP_TOKENS || '50', 10),
+  // Chunker dispatch: 'v1' (legacy greedy paragraph packer) | 'v2' (type-aware,
+  // emits content_type/section_heading per chunk). v1 is the default until
+  // Phase 5's bench shows v2 improvement on the live corpus; flip via
+  // CHUNKER_VERSION=v2 to opt newly-indexed guides into v2 without re-indexing
+  // already-indexed ones (mixed populations are fine — schema v11 defaults
+  // legacy rows to content_type='prose'). See CHUNKER_DESIGN.md.
+  chunkerVersion: (process.env.CHUNKER_VERSION === 'v2' ? 'v2' : 'v1') as 'v1' | 'v2',
   // ANN (USearch HNSW i8). Default file lives next to the SQLite db so a
   // single mount covers both. Knobs match the bake-off run that picked
   // USearch i8 (recall@8 87% end-to-end vs the brute-force baseline,

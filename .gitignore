@@ -39,3 +39,7 @@ Thumbs.db
 # Scratch and one-off experiment outputs (large binary dumps, side indexes)
 /scratch/
 *.usearch
+
+# Bench Q&A dump files (written by rag-bench-dump.mjs and rag-accuracy.test.ts)
+/bench-qa.txt
+/tests/benchmarks/bench-qa.txt

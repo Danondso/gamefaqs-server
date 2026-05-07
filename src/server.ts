@@ -7,6 +7,9 @@ import { EmbeddingService } from './services/EmbeddingService';
 import { SynthesisService } from './services/SynthesisService';
 import { RetrievalService } from './services/RetrievalService';
 import { AnswerService } from './services/AnswerService';
+import { GameExtractionService } from './services/GameExtractionService';
+import { ProductiveRefusalService } from './services/ProductiveRefusalService';
+import { SessionContextService } from './services/SessionContextService';
 import GuideModel from './models/Guide';
 import { openApiSpec } from './openapi';
 
@@ -50,7 +53,10 @@ async function main() {
     db: Database,
     embeddingService,
   });
-  const answerService = new AnswerService({ retrievalService, synthesisService });
+  const extractionService = new GameExtractionService(Database, retrievalService);
+  const refusalService = new ProductiveRefusalService();
+  const sessionContextService = new SessionContextService();
+  const answerService = new AnswerService({ retrievalService, synthesisService, extractionService, refusalService });
 
   // Create Express app
   const app = express();
@@ -115,7 +121,7 @@ async function main() {
   );
 
   // API Routes
-  app.use('/api/guides', createGuidesRouter({ guideModel: GuideModel, answerService }));
+  app.use('/api/guides', createGuidesRouter({ guideModel: GuideModel, answerService, retrievalService, sessionContextService }));
   app.use('/api/guides/:guideId/bookmarks', bookmarksRouter);
   app.use('/api/guides/:guideId/notes', notesRouter);
   app.use('/api/games', gamesRouter);

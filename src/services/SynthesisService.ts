@@ -136,9 +136,35 @@ export class SynthesisService {
     });
   }
 
+  /**
+   * Remove structural list indices (e.g. "1. ", nested "- 2. ") before testing for
+   * arabic digits in hasGroundedClaims. Line-start numbering is not substantive
+   * game data — level numbers ("L54", "Lv 56") remain if not matched here.
+   */
+  private stripStructuralListMarkersForGrounding(body: string): string {
+    // Models often omit the space after the marker ("1.Defeat…") or wrap it in
+    // markdown ("**1.** …"). Allow optional blockquote / bullet prefix; require
+    // whitespace after the marker OR an immediate letter so we do not eat "3.5"-style decimals.
+    const lineDot = /^\s*(?:>\s*)?(?:[-*+]\s+)?(?:\*{1,2})?\d+\.(?:\*{1,2})?(?:\s+|(?=\p{L}))/gmu;
+    const lineParen = /^\s*(?:>\s*)?(?:[-*+]\s+)?(?:\*{1,2})?\d+\)(?:\*{1,2})?(?:\s+|(?=\p{L}))/gmu;
+    // Inline "…steps: 1. …" / "…follow:\n1." — same rules; avoid decimals after ':' (e.g. 3.14)
+    // because the suffix must be space or a letter, not another digit.
+    const afterBreak =
+      /(?<=[\n\r:;])\s*(?:\*{1,2})?\d+\.(?:\*{1,2})?(?:\s+|(?=\p{L}))|(?<=[\n\r:;])\s*(?:\*{1,2})?\d+\)(?:\*{1,2})?(?:\s+|(?=\p{L}))/gu;
+
+    let s = body;
+    for (let i = 0; i < 6; i++) {
+      const next = s.replace(lineDot, '').replace(lineParen, '').replace(afterBreak, '');
+      if (next === s) break;
+      s = next;
+    }
+    return s;
+  }
+
   private hasGroundedClaims(text: string, maxIndex: number): boolean {
     if (!text.trim()) return false; // empty/whitespace = no grounded claims
-    if (!/\d/.test(text) && !/\[[\d,\s]+\]/.test(text)) return true;
+    const forDigitCheck = this.stripStructuralListMarkersForGrounding(text);
+    if (!/\d/.test(forDigitCheck) && !/\[[\d,\s]+\]/.test(text)) return true;
     const cites = text.match(/\[(\d+(?:\s*,\s*\d+)*)\]/g) ?? [];
     if (cites.length === 0) return false;
     for (const c of cites) {

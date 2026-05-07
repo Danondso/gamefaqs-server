@@ -27,12 +27,15 @@ function createStubAnswerService(defaultResult: AnswerResult): Stub {
 const happyResult: AnswerResult = {
   answer: 'Save by visiting an inn. [1]',
   no_answer: false,
+  extraction: { status: 'confident', gameId: 'g1', confidence: 1, reason: 'explicit_alias' },
   citations: [
     {
       guide_id: 'g1',
       guide_title: 'Sample Guide',
       chunk_id: 'c1',
       chunk_index: 0,
+      gamefaqs_id: null,
+      content: 'You can save your game at inns and save points.',
       excerpt: 'You can save your game at inns and save points.',
       score: 0.5,
     },

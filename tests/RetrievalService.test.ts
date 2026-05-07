@@ -251,6 +251,59 @@ describe('RetrievalService', () => {
     expect(citations[0].excerpt.length).toBe(300);
   });
 
+  it('hard gameId filter excludes wrong-game chunks from vec, fts, and title-expanded hits', async () => {
+    // Distinct title tokens so title-FTS query is non-empty (rare in guides_fts_meta_vocab).
+    const gWrong: SeededGuide = {
+      id: 'g-wrong',
+      title: 'Wrong xyzzytitle Guide',
+      game_id: 'game-wrong',
+    };
+    const gRight: SeededGuide = {
+      id: 'g-right',
+      title: 'Right florpb Guide',
+      game_id: 'game-right',
+    };
+    const chunks: SeededChunk[] = [
+      { id: 'c-w1', guide_id: gWrong.id, index: 0, content: 'wrong alpha '.repeat(20) },
+      { id: 'c-w2', guide_id: gWrong.id, index: 1, content: 'wrong beta '.repeat(20) },
+      { id: 'c-r1', guide_id: gRight.id, index: 0, content: 'right one '.repeat(20) },
+      { id: 'c-r2', guide_id: gRight.id, index: 1, content: 'right two '.repeat(20) },
+    ];
+    seed(db, [gWrong, gRight], chunks);
+
+    const vectorSearch = (): VectorHit[] => [
+      { chunk_id: 'c-w1', distance: 0.01 },
+      { chunk_id: 'c-r1', distance: 0.5 },
+    ];
+    const ftsSearch = (): FtsHit[] => [
+      { chunk_id: 'c-w2', rank: -2 },
+      { chunk_id: 'c-r2', rank: -1 },
+    ];
+    const titleSearch = (): TitleHit[] => [
+      { guide_id: gWrong.id, rank: 0 },
+      { guide_id: gRight.id, rank: 1 },
+    ];
+
+    const svc = new RetrievalService({
+      db,
+      embeddingService: mockEmbedder,
+      vectorSearch,
+      ftsSearch,
+      titleSearch,
+      rrfK: 60,
+    });
+
+    const citations = await svc.retrieve('xyzzytitle florpb gameplay', { gameId: 'game-right' }, 8);
+    const wrongChunkIds = new Set(['c-w1', 'c-w2']);
+    for (const c of citations) {
+      expect(wrongChunkIds.has(c.chunk_id)).toBe(false);
+      expect(c.guide_id).toBe(gRight.id);
+    }
+    const ids = new Set(citations.map((c) => c.chunk_id));
+    expect(ids.has('c-r1')).toBe(true);
+    expect(ids.has('c-r2')).toBe(true);
+  });
+
   it('drops chunks whose guide does not match gameId filter', async () => {
     const guides: SeededGuide[] = [
       { id: 'gA', title: 'A', game_id: 'game-1' },

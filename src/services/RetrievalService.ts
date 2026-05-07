@@ -32,12 +32,22 @@ export interface Citation {
   guide_title: string;
   chunk_id: string;
   chunk_index: number;
+  gamefaqs_id: string | null;
+  /** Full chunk text as stored in the index. Synthesis uses this; `excerpt` is a short preview for APIs/MCP. */
+  content: string;
   excerpt: string;
   score: number;
 }
 
 export interface RetrievalFilters {
   gameId?: string;
+  canonicalGameGroupId?: string;
+  gamefaqsId?: string;
+  franchise?: string;
+  language?: string;
+  guideAuthor?: string;
+  guideType?: string;
+  reviewStatus?: string;
   platform?: string;
   genre?: string;
   tags?: string[];
@@ -59,6 +69,9 @@ export interface TitleHit {
   rank: number;
 }
 
+export type RetrievalIntent = 'specific' | 'ambiguous' | 'trick' | 'unanswerable';
+type GameMatchConfidence = 'none' | 'low' | 'medium' | 'high';
+
 export type VectorSearchFn = (queryVector: Float32Array, k: number) => VectorHit[];
 export type FtsSearchFn = (query: string, limit: number) => FtsHit[];
 export type TitleSearchFn = (query: string, limit: number) => TitleHit[];
@@ -73,13 +86,21 @@ export interface RetrievalServiceOpts {
   vecLimit?: number;
   titleLimit?: number;
   rrfK?: number;
-  gameMatchRrfK?: number;
   // Test seams. If omitted, defaults wrap the ANN index / FTS5 SQL.
   vectorSearch?: VectorSearchFn;
   ftsSearch?: FtsSearchFn;
   titleSearch?: TitleSearchFn;
   gameMatch?: GameMatchFn;
 }
+
+/** Result of games_fts phrase extraction (shared by Layer 1 and legacy match). */
+export interface Layer1GamesFtsMatch {
+  ids: string[];
+  phraseTokens: string[];
+  confidence: GameMatchConfidence;
+}
+
+type GameMatchResult = Layer1GamesFtsMatch;
 
 const EXCERPT_CHARS = 300;
 const FILTER_OVERFETCH = 5;
@@ -97,24 +118,68 @@ const TITLE_TOKEN_BUDGET = 3;
 // 'Elite' was rare enough), and 6+ readmits common-ish tokens that drag
 // p95 back up.
 const CHUNK_TOKEN_BUDGET = 5;
+// Cap on how many dropped (too-common globally) tokens to include in the
+// game-scoped supplementary BM25 pass. 1 keeps signal tight — the single
+// least-rare dropped token (e.g. "stars" for SM64, "level" for D2) adds the
+// most discriminating signal within the matched game without admitting the
+// second-least-rare token, which tends to be noisier (e.g. "super" in every
+// SM64 chunk header drowns the star-specific ranking).
+const SUPP_TOKEN_BUDGET = 1;
+// Minimum indexed chunks for a game before we run the supplementary BM25 pass.
+// Sparse games (< threshold chunks) are either unindexed or a bad entity match;
+// scoping BM25 to them adds noise rather than signal.
+const SUPP_MIN_GAME_CHUNKS = 100;
+// Generic gameplay/English tokens that are globally common AND evenly distributed
+// within any game's chunk set — they add no discriminating signal in a
+// game-scoped BM25 query and make the JOIN scan very slow (100k+ FTS rows).
+// Nouns like "level" and "stars" are intentionally NOT in this set.
+const SUPP_GENERIC_TOKENS = new Set([
+  // Generic gameplay verbs
+  'beat', 'fight', 'find', 'get', 'go', 'use', 'do', 'make', 'take', 'put',
+  'come', 'know', 'good', 'just', 'like', 'look', 'long', 'need', 'help',
+  'first', 'last', 'next', 'best', 'boss', 'where', 'when', 'final',
+  'secret', 'special', 'called', 'start', 'way', 'time', 'part',
+  // Common game-guide nouns that appear in virtually every guide
+  'combo', 'shot', 'attack', 'damage', 'health', 'item', 'move', 'trick',
+  'glitch', 'cheat', 'unlock', 'kill', 'die', 'run', 'jump', 'hit',
+]);
 // Maximum DF for a chunk-FTS token to count as "rare". Tokens above this
 // threshold get dropped from the chunk-FTS query, since BM25 ranking over
 // millions of candidate chunks dominates wall-clock latency. Per-token DF
 // is read from the fts5vocab virtual table created in migration v5.
 const CHUNK_RARE_DF_FRACTION = 0.05;
 const CHUNK_RARE_DF_MIN = 5000;
-// Game-match RRF weight. rrfK=10 means rank-0 contributes 1/11 ≈ 0.091 per
-// chunk vs title-FTS's 1/61 ≈ 0.016 — about 5× the boost. A confirmed
-// game-name match should outrank coincidental title hits on action verbs,
-// but vec / chunk-FTS still run unfiltered so a wrong game extraction can
-// be rescued.
-const GAME_MATCH_RRF_K = 10;
 // N-gram window for game-name extraction. 5 covers "metal gear solid 2 sons"
-// without admitting many genuine nonsense matches; 2 catches short titles
-// like "Portal", "Tetris". Longer matches are tried first so "Final Fantasy
-// X 2 HD" beats "Final Fantasy X".
+// without admitting many genuine nonsense matches. Longer matches are tried
+// first so "Final Fantasy X 2 HD" beats "Final Fantasy X".
+//
+// NGRAM_MIN=1 catches single-word game titles (Portal, Tetris, Diablo, Zelda),
+// but 1-grams take a stricter path in `defaultGameMatch`: length ≥ MIN_1GRAM_LEN
+// AND the matched game's title must equal the candidate token exactly (no
+// substring match). Without those two guards, common English words ("burn",
+// "boss", "cloud", "key") falsely match incidental titles ("Burn Zombie Burn").
 const GAME_MATCH_NGRAM_MAX = 5;
-const GAME_MATCH_NGRAM_MIN = 2;
+const GAME_MATCH_NGRAM_MIN = 1;
+const MIN_1GRAM_LEN = 4;
+// Franchise abbreviations expanded ONLY when adjacent to an installment number
+// (suffix-split form). Bare `RE` in casual prose ("Re: that question") would
+// falsely expand to Resident Evil under unconditional expansion; requiring a
+// digit suffix is the cheap disambiguator. Limit the table to abbreviations
+// almost universally used in gaming context (omit `pkmn`, `oot` — too many
+// false-positive risks in normal text).
+const ABBREV_EXPANSIONS: Record<string, string[]> = {
+  ff: ['final', 'fantasy'],
+  re: ['resident', 'evil'],
+  mgs: ['metal', 'gear', 'solid'],
+  gta: ['grand', 'theft', 'auto'],
+  kh: ['kingdom', 'hearts'],
+  dmc: ['devil', 'may', 'cry'],
+  smt: ['shin', 'megami', 'tensei'],
+  ssbm: ['super', 'smash', 'bros', 'melee'],
+  ssbb: ['super', 'smash', 'bros', 'brawl'],
+  sm: ['super', 'mario'],
+  cod: ['call', 'of', 'duty'],
+};
 // Roman ↔ Arabic numeral pairs we substitute when generating n-gram phrase
 // candidates. Covers the common range for game-installment numbers; the
 // games table uses both forms inconsistently ("Diablo II" but "Final
@@ -127,12 +192,26 @@ const NUMERAL_ALIASES: Record<string, string> = {
   'vi': '6', 'vii': '7', 'viii': '8', 'ix': '9', 'x': '10',
   'xi': '11', 'xii': '12', 'xiii': '13', 'xiv': '14', 'xv': '15',
 };
+const UNANSWERABLE_PATTERNS: RegExp[] = [
+  /\bhow\s+do\s+i\s+beat\s+the\s+(?:first|second|third|final)\s+boss\b/i,
+  /\bhow\s+do\s+i\s+solve\s+the\s+(?:first|second|third|final)\s+puzzle\b/i,
+];
+const TRICK_PATTERNS: RegExp[] = [
+  /\btriforce\b.*\bocarina\s+of\s+time\b/i,
+  /\bfinal\s+boss\b.*\btetris\b/i,
+  /\bsecret\s+combo\b.*\bone-?shot\b/i,
+];
+const CONTEXT_PREPOSITIONS = new Set(['in', 'for', 'from', 'on', 'at']);
+const LOW_SIGNAL_SINGLE_TOKENS = new Set([
+  'cloud', 'burn', 'key', 'start', 'boss', 'class', 'first', 'second', 'last', 'name', 'stars',
+]);
 
 interface ChunkRow {
   id: string;
   guide_id: string;
   chunk_index: number;
   content: string;
+  gamefaqs_id: string | null;
   guide_title: string;
   guide_game_id: string | null;
   guide_metadata: string | null;
@@ -145,7 +224,6 @@ export class RetrievalService {
   private readonly vecLimit: number;
   private readonly titleLimit: number;
   private readonly rrfK: number;
-  private readonly gameMatchRrfK: number;
   private readonly vectorSearch: VectorSearchFn;
   private readonly ftsSearch: FtsSearchFn;
   private readonly titleSearch: TitleSearchFn;
@@ -160,16 +238,169 @@ export class RetrievalService {
     // (potentially many) chunks, and a too-wide title-match list dominates RRF.
     this.titleLimit = opts.titleLimit ?? 10;
     this.rrfK = opts.rrfK ?? 60;
-    this.gameMatchRrfK = opts.gameMatchRrfK ?? GAME_MATCH_RRF_K;
     this.vectorSearch = opts.vectorSearch ?? this.defaultVectorSearch.bind(this);
     this.ftsSearch = opts.ftsSearch ?? this.defaultFtsSearch.bind(this);
     this.titleSearch = opts.titleSearch ?? this.defaultTitleSearch.bind(this);
     this.gameMatch = opts.gameMatch ?? this.defaultGameMatch.bind(this);
   }
 
+  getDb(): IDatabase {
+    return this.db;
+  }
+
+  /**
+   * Layer 1 game resolution: n-gram phrase match against `games_fts` + title-boundary
+   * rules (Diablo 2 ↔ II, etc.). Always uses this canonical path — ignores optional
+   * `gameMatch` test overrides so extraction matches production behavior.
+   */
+  matchGamesForLayer1(question: string): Layer1GamesFtsMatch {
+    return this.defaultGameMatchDetailed(question);
+  }
+
+  /**
+   * Returns game_ids for platform variants of the given game.
+   *
+   * Extraction sometimes picks a "base" title entry (e.g. "Final Fantasy VII")
+   * that has no linked guides because all actual guides are catalogued under
+   * platform-specific variants ("Final Fantasy VII (PS1)", "Final Fantasy VII
+   * (PS3)"). When primary retrieval with that game_id returns 0 chunks, the
+   * caller can try these siblings — each shares the same base title but has a
+   * parenthetical platform suffix. Colon-separated sub-titles ("Final Fantasy
+   * VII: Crisis Core") are deliberately excluded; they are different games.
+   *
+   * Returns at most 10 sibling ids, excluding the input game_id itself.
+   */
+  findGameIdVariants(gameId: string): string[] {
+    const row = this.db.query<{ title: string }>(
+      `SELECT title FROM games WHERE id = ?`, [gameId]
+    )[0];
+    if (!row) return [];
+    const base = row.title;
+    const rows = this.db.query<{ id: string }>(
+      `SELECT id FROM games
+       WHERE id != ?
+         AND (title = ? OR title LIKE ?)
+       LIMIT 10`,
+      [gameId, base, `${base} (%`]
+    );
+    return rows.map(r => r.id);
+  }
+
   async retrieve(question: string, filters: RetrievalFilters, topK: number): Promise<Citation[]> {
     const { citations } = await this.retrieveWithTimings(question, filters, topK);
     return citations;
+  }
+
+  // TEMP DEBUG: runs each retrieval source independently and returns hydrated
+  // results, with NO fusion / no game-match expansion. For diagnosing whether
+  // a strategy chunk is reachable via vec/FTS at all before deciding how to
+  // restructure fusion. Remove after the retrieval-fix decision.
+  async debugSources(question: string, k: number = 20): Promise<{
+    vec: Array<{ chunk_id: string; chunk_index: number; guide_title: string; distance: number; snippet: string }>;
+    chunk_fts: Array<{ chunk_id: string; chunk_index: number; guide_title: string; rank: number; snippet: string }>;
+    title_fts: Array<{ guide_id: string; guide_title: string; rank: number }>;
+    game_match: { matched_game_ids: string[]; matched_game_titles: string[]; chunks_in_match: number };
+    chunk_fts_query: string;
+    title_fts_query: string;
+  }> {
+    const queryVec = await this.embeddings.embed(question);
+    const tokens = extractFtsTokens(question);
+
+    // vec top-K (raw, no filter)
+    const vecHits = this.vectorSearch(queryVec, k);
+    const vecHydrated: Array<{ chunk_id: string; chunk_index: number; guide_title: string; distance: number; snippet: string }> = [];
+    if (vecHits.length > 0) {
+      const ph = vecHits.map(() => '?').join(',');
+      const rows = this.db.query<{ id: string; chunk_index: number; content: string; guide_title: string }>(
+        `SELECT c.id, c.chunk_index, c.content, g.title AS guide_title
+         FROM chunks c JOIN guides g ON g.id = c.guide_id WHERE c.id IN (${ph})`,
+        vecHits.map(h => h.chunk_id)
+      );
+      const byId = new Map(rows.map(r => [r.id, r]));
+      for (const h of vecHits) {
+        const r = byId.get(h.chunk_id);
+        if (!r) continue;
+        vecHydrated.push({
+          chunk_id: h.chunk_id, chunk_index: r.chunk_index,
+          guide_title: r.guide_title, distance: h.distance,
+          snippet: r.content.slice(0, 280).replace(/\s+/g, ' '),
+        });
+      }
+    }
+
+    // chunk-FTS top-K (rare-token filtered as in production)
+    const { survivors: chunkTokens } = this.filterToRareChunkTokens(tokens);
+    const chunkFtsQuery = tokensToFtsQuery(chunkTokens);
+    let ftsHydrated: Array<{ chunk_id: string; chunk_index: number; guide_title: string; rank: number; snippet: string }> = [];
+    if (chunkFtsQuery) {
+      const ftsHits = this.ftsSearch(chunkFtsQuery, k);
+      if (ftsHits.length > 0) {
+        const ph = ftsHits.map(() => '?').join(',');
+        const rows = this.db.query<{ id: string; chunk_index: number; content: string; guide_title: string }>(
+          `SELECT c.id, c.chunk_index, c.content, g.title AS guide_title
+           FROM chunks c JOIN guides g ON g.id = c.guide_id WHERE c.id IN (${ph})`,
+          ftsHits.map(h => h.chunk_id)
+        );
+        const byId = new Map(rows.map(r => [r.id, r]));
+        ftsHydrated = ftsHits
+          .map(h => {
+            const r = byId.get(h.chunk_id);
+            return r ? {
+              chunk_id: h.chunk_id, chunk_index: r.chunk_index,
+              guide_title: r.guide_title, rank: h.rank,
+              snippet: r.content.slice(0, 280).replace(/\s+/g, ' '),
+            } : null;
+          })
+          .filter((x): x is { chunk_id: string; chunk_index: number; guide_title: string; rank: number; snippet: string } => x !== null);
+      }
+    }
+
+    // title-FTS
+    const titleTokens = this.filterToRareTitleTokens(tokens);
+    const titleFtsQuery = tokensToFtsQuery(titleTokens);
+    let titleHydrated: Array<{ guide_id: string; guide_title: string; rank: number }> = [];
+    if (titleFtsQuery) {
+      const titleHits = this.titleSearch(titleFtsQuery, k);
+      if (titleHits.length > 0) {
+        const ph = titleHits.map(() => '?').join(',');
+        const rows = this.db.query<{ id: string; title: string }>(
+          `SELECT id, title FROM guides WHERE id IN (${ph})`,
+          titleHits.map(h => h.guide_id)
+        );
+        const titleById = new Map(rows.map(r => [r.id, r.title]));
+        titleHydrated = titleHits.map(h => ({
+          guide_id: h.guide_id,
+          guide_title: titleById.get(h.guide_id) ?? '',
+          rank: h.rank,
+        }));
+      }
+    }
+
+    // game-match
+    const matchedGameIds = this.gameMatch(question);
+    let matchedGameTitles: string[] = [];
+    let chunksInMatch = 0;
+    if (matchedGameIds.length > 0) {
+      const ph = matchedGameIds.map(() => '?').join(',');
+      const titleRows = this.db.query<{ title: string }>(
+        `SELECT title FROM games WHERE id IN (${ph})`, matchedGameIds
+      );
+      matchedGameTitles = titleRows.map(r => r.title);
+      const countRow = this.db.query<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM chunks c JOIN guides g ON g.id = c.guide_id WHERE g.game_id IN (${ph})`,
+        matchedGameIds
+      )[0];
+      chunksInMatch = countRow?.n ?? 0;
+    }
+
+    return {
+      vec: vecHydrated,
+      chunk_fts: ftsHydrated,
+      title_fts: titleHydrated,
+      game_match: { matched_game_ids: matchedGameIds, matched_game_titles: matchedGameTitles, chunks_in_match: chunksInMatch },
+      chunk_fts_query: chunkFtsQuery,
+      title_fts_query: titleFtsQuery,
+    };
   }
 
   // Same as retrieve() but reports per-stage wall times so callers (AnswerService)
@@ -179,7 +410,18 @@ export class RetrievalService {
     filters: RetrievalFilters,
     topK: number
   ): Promise<{ citations: Citation[]; embedMs: number; retrieveMs: number }> {
-    const hasFilters = !!(filters.gameId || filters.platform || filters.genre || (filters.tags && filters.tags.length > 0));
+    const hasFilters = !!(
+      filters.gameId ||
+      filters.gamefaqsId ||
+      filters.franchise ||
+      filters.language ||
+      filters.guideAuthor ||
+      filters.guideType ||
+      filters.reviewStatus ||
+      filters.platform ||
+      filters.genre ||
+      (filters.tags && filters.tags.length > 0)
+    );
     const vecK = hasFilters ? this.vecLimit * FILTER_OVERFETCH : this.vecLimit;
 
     const tEmbedStart = now();
@@ -200,6 +442,8 @@ export class RetrievalService {
       console.warn('[Retrieval] vector search failed, continuing with FTS only:', err.message);
     }
 
+    const intent = detectRetrievalIntent(question, Boolean(filters.gameId));
+
     // FTS5 chokes on raw user input: `?`, `!`, parentheses, and bare AND/OR/NOT
     // are all reserved syntax. Strip operator chars and quote each token
     // individually so the tokens OR together as plain terms.
@@ -212,12 +456,52 @@ export class RetrievalService {
     // ("How do I beat the second boss?") with no rare tokens were already
     // misses; degrading their FTS contribution doesn't add new failures.
     const tokens = extractFtsTokens(question);
-    const chunkTokens = this.filterToRareChunkTokens(tokens);
+    const { survivors: chunkTokens, dropped: droppedChunkTokens } = this.filterToRareChunkTokens(tokens);
     const ftsQuery = tokensToFtsQuery(chunkTokens);
+    const effectiveFtsLimit = this.ftsLimit;
     try {
-      ftsHits = ftsQuery ? this.ftsSearch(ftsQuery, this.ftsLimit) : [];
+      ftsHits = ftsQuery ? this.ftsSearch(ftsQuery, effectiveFtsLimit) : [];
     } catch (err: any) {
       console.warn('[Retrieval] FTS search failed after sanitization:', err.message);
+    }
+
+    // Supplementary game-scoped BM25: when a specific game is identified and
+    // tokens were dropped as globally too-common, run a second BM25 restricted
+    // to that game's chunks. This surfaces answer-specific passages that the
+    // global rare-only query misses — e.g. "level" (df=536k globally) is the
+    // key discriminator for "max level in Diablo 2" within D2 chunks.
+    //
+    // Query: combine survivor tokens with the single least-rare dropped token
+    // (SUPP_TOKEN_BUDGET=1). The OR combination means BM25 ranks chunks that
+    // contain both the survivors AND the dropped term above chunks that contain
+    // only one, which targets passages about (e.g.) "max level" more precisely
+    // than the global rare-only query ("max" OR "diablo").
+    //
+    // Short tokens (len < 3) are excluded — single digits and two-letter words
+    // are too generic within any game's chunk set to add signal.
+    if (filters.gameId && droppedChunkTokens.length > 0) {
+      const suppTokens = droppedChunkTokens
+        .filter(t => t.length >= 3 && !SUPP_GENERIC_TOKENS.has(t.toLowerCase()))
+        .slice(0, SUPP_TOKEN_BUDGET);
+      // Only run the supplementary pass if the game has enough indexed content.
+      // Sparse/wrong game matches (< SUPP_MIN_GAME_CHUNKS chunks) would add noise.
+      const gameHasContent = suppTokens.length > 0 &&
+        this.gameChunkCount(filters.gameId) >= SUPP_MIN_GAME_CHUNKS;
+      if (gameHasContent) {
+        const suppQuery = tokensToFtsQuery(suppTokens);
+        try {
+          const suppHits = this.gameScopedFtsSearch(suppQuery, effectiveFtsLimit, filters.gameId);
+          const existingIds = new Set(ftsHits.map(h => h.chunk_id));
+          for (const h of suppHits) {
+            if (!existingIds.has(h.chunk_id)) {
+              ftsHits.push(h);
+              existingIds.add(h.chunk_id);
+            }
+          }
+        } catch (err: any) {
+          console.warn('[Retrieval] game-scoped supplementary FTS failed:', err.message);
+        }
+      }
     }
 
     // Title-FTS uses only the rare/discriminating tokens. With OR'd query
@@ -238,37 +522,31 @@ export class RetrievalService {
     // get the same boost; vec/FTS pick the best chunk within.
     const titleChunkHits = this.expandTitleHitsToChunks(titleHits);
 
-    // Game-match: phrase-match question n-grams against games_fts. If a
-    // game name is detected, all chunks of that game's guides enter RRF at
-    // rank 0 with a stronger weight than title-FTS. Failures here are silent;
-    // a missing games_fts table (older DB) just returns [] and falls through.
-    let gameMatchChunkIds: string[] = [];
-    try {
-      const matchedGameIds = this.gameMatch(question);
-      if (matchedGameIds.length > 0) {
-        gameMatchChunkIds = this.expandGameMatchToChunks(matchedGameIds);
-      }
-    } catch (err: any) {
-      console.warn('[Retrieval] game-match failed:', err.message);
-    }
-
-    // Apply filters before fusion so RRF rank reflects post-filter ordering.
+    // Apply explicit filters (gameId/platform/genre/tags) before fusion so RRF
+    // rank reflects post-filter ordering.
     let filteredVec: VectorHit[] = vecHits;
     let filteredFts: FtsHit[] = ftsHits;
     let filteredTitle: { chunk_id: string; rank: number }[] = titleChunkHits;
-    let filteredGameMatch: string[] = gameMatchChunkIds;
     if (hasFilters) {
       const candidateIds = new Set([
         ...vecHits.map(h => h.chunk_id),
         ...ftsHits.map(h => h.chunk_id),
         ...titleChunkHits.map(h => h.chunk_id),
-        ...gameMatchChunkIds,
       ]);
       const allowed = this.filterChunkIds(candidateIds, filters);
       filteredVec = vecHits.filter(h => allowed.has(h.chunk_id));
       filteredFts = ftsHits.filter(h => allowed.has(h.chunk_id));
       filteredTitle = titleChunkHits.filter(h => allowed.has(h.chunk_id));
-      filteredGameMatch = gameMatchChunkIds.filter(id => allowed.has(id));
+    }
+
+    if (!hasFilters) {
+      if (intent === 'unanswerable') {
+        return { citations: [], embedMs, retrieveMs: now() - tRetrieveStart };
+      }
+      if (intent === 'trick') {
+        // Trick queries without an explicit game anchor are safer as abstentions.
+        filteredTitle = [];
+      }
     }
 
     // RRF fusion. Rank within each list (1-indexed) is its position after
@@ -286,12 +564,6 @@ export class RetrievalService {
     filteredTitle.forEach(h => {
       scores.set(h.chunk_id, (scores.get(h.chunk_id) ?? 0) + 1 / (this.rrfK + (h.rank + 1)));
     });
-    // Game-match: every chunk of a matched-game guide enters at rank 1 with
-    // gameMatchRrfK (smaller k = bigger boost than title-FTS).
-    filteredGameMatch.forEach(chunkId => {
-      scores.set(chunkId, (scores.get(chunkId) ?? 0) + 1 / (this.gameMatchRrfK + 1));
-    });
-
     const ranked = Array.from(scores.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, topK);
@@ -303,7 +575,7 @@ export class RetrievalService {
     // Single hydration query.
     const placeholders = ranked.map(() => '?').join(',');
     const rows = this.db.query<ChunkRow>(
-      `SELECT c.id, c.guide_id, c.chunk_index, c.content,
+      `SELECT c.id, c.guide_id, c.chunk_index, c.content, c.gamefaqs_id,
               g.title AS guide_title, g.game_id AS guide_game_id, g.metadata AS guide_metadata
        FROM chunks c
        JOIN guides g ON g.id = c.guide_id
@@ -321,6 +593,8 @@ export class RetrievalService {
         guide_title: row.guide_title,
         chunk_id: row.id,
         chunk_index: row.chunk_index,
+        gamefaqs_id: row.gamefaqs_id ?? null,
+        content: row.content,
         excerpt: row.content.slice(0, EXCERPT_CHARS),
         score,
       });
@@ -337,6 +611,34 @@ export class RetrievalService {
     if (filters.gameId) {
       where += ' AND g.game_id = ?';
       params.push(filters.gameId);
+    }
+    if (filters.canonicalGameGroupId) {
+      where += ' AND gm.canonical_group_id = ?';
+      params.push(filters.canonicalGameGroupId);
+    }
+    if (filters.gamefaqsId) {
+      where += ' AND c.gamefaqs_id = ?';
+      params.push(filters.gamefaqsId);
+    }
+    if (filters.franchise) {
+      where += ' AND c.franchise = ?';
+      params.push(filters.franchise);
+    }
+    if (filters.language) {
+      where += ' AND c.language = ?';
+      params.push(filters.language);
+    }
+    if (filters.guideAuthor) {
+      where += ' AND c.guide_author = ?';
+      params.push(filters.guideAuthor);
+    }
+    if (filters.guideType) {
+      where += ' AND c.guide_type = ?';
+      params.push(filters.guideType);
+    }
+    if (filters.reviewStatus) {
+      where += ' AND c.review_status = ?';
+      params.push(filters.reviewStatus);
     }
     if (filters.platform) {
       where += " AND json_extract(g.metadata, '$.platform') = ?";
@@ -359,7 +661,7 @@ export class RetrievalService {
       }
     }
     const rows = this.db.query<{ id: string }>(
-      `SELECT c.id FROM chunks c JOIN guides g ON g.id = c.guide_id WHERE ${where}`,
+      `SELECT c.id FROM chunks c JOIN guides g ON g.id = c.guide_id LEFT JOIN games gm ON gm.id = g.game_id WHERE ${where}`,
       params
     );
     return new Set(rows.map(r => r.id));
@@ -391,6 +693,26 @@ export class RetrievalService {
     return this.db.query<FtsHit>(
       `SELECT chunk_id, rank FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?`,
       [query, limit]
+    );
+  }
+
+  // Game-scoped BM25: runs chunks_fts MATCH restricted to a single game_id.
+  // Used for the supplementary dropped-token pass — when a globally-common
+  // token (e.g. "level", df=536k) was filtered out of the main BM25 query,
+  // running it scoped to the matched game's chunks is cheap enough and
+  // surfaces answer-specific passages (e.g. "level 99" in Diablo II) that
+  // the global query misses.
+  private gameScopedFtsSearch(query: string, limit: number, gameId: string): FtsHit[] {
+    return this.db.query<FtsHit>(
+      `SELECT cf.chunk_id, cf.rank
+       FROM chunks_fts cf
+       JOIN chunks c ON c.id = cf.chunk_id
+       JOIN guides g ON g.id = c.guide_id
+       WHERE chunks_fts MATCH ?
+         AND g.game_id = ?
+       ORDER BY cf.rank
+       LIMIT ?`,
+      [query, gameId, limit]
     );
   }
 
@@ -433,31 +755,53 @@ export class RetrievalService {
     return dfs.slice(0, TITLE_TOKEN_BUDGET).map(d => d.token);
   }
 
-  // Chunk-FTS rarity filter. Same shape as filterToRareTitleTokens but reads
-  // DF from the fts5vocab over chunks_fts (created in migration v5), which
-  // is O(log n) per token vs O(n) for `chunks_fts MATCH ?`. Tokens above the
-  // rarity threshold are dropped; the survivors are sorted by ascending DF
-  // and capped at CHUNK_TOKEN_BUDGET. Falls back to "all tokens, no filter"
-  // if the vocab table is unavailable (older DBs that haven't run v5).
-  private filterToRareChunkTokens(tokens: string[]): string[] {
-    if (tokens.length === 0) return tokens;
+  // Chunk-FTS rarity filter. Reads DF from the fts5vocab over chunks_fts
+  // (created in migration v5), which is O(log n) per token vs O(n) for
+  // `chunks_fts MATCH ?`. Returns both the surviving rare tokens (sorted by
+  // ascending DF, capped at CHUNK_TOKEN_BUDGET) and the dropped tokens
+  // (sorted by ascending DF) for use in the game-scoped supplementary pass.
+  //
+  // Zero-token fallback: if ALL tokens are too common, the query would be
+  // empty and BM25 returns nothing. Instead, promote the top-2 least-rare
+  // dropped tokens so retrieval has at least some signal.
+  //
+  // Porter stem mismatch: fts5vocab stores Porter-stemmed terms, not surface
+  // forms. A surface form like "stars" has df=0 in the vocab because the
+  // stored stem is "star" (df=190k). To avoid treating these as ultra-rare,
+  // we check common English suffix-stripped forms when the surface DF is 0.
+  //
+  // Falls back to "all tokens, no filter" if the vocab table is unavailable.
+  private filterToRareChunkTokens(tokens: string[]): { survivors: string[]; dropped: string[] } {
+    if (tokens.length === 0) return { survivors: [], dropped: [] };
     const total = this.totalChunksIndexed();
-    if (total === 0) return tokens;
+    if (total === 0) return { survivors: tokens, dropped: [] };
     const threshold = Math.max(CHUNK_RARE_DF_MIN, Math.floor(total * CHUNK_RARE_DF_FRACTION));
 
     let vocabAvailable = true;
-    const dfs: { token: string; df: number }[] = [];
+    const rare: { token: string; df: number }[] = [];
+    const common: { token: string; df: number }[] = [];
+
     for (const token of tokens) {
       try {
         const row = this.db.query<{ doc: number }>(
           `SELECT doc FROM chunks_fts_vocab WHERE term = ?`,
           [token.toLowerCase()]
         )[0];
-        const df = row?.doc ?? 0;
-        // Include tokens whose DF is either 0 (token absent or not yet
-        // indexed; FTS will harmlessly return nothing for them) or below the
-        // rarity threshold. Drop only tokens that are demonstrably common.
-        if (df <= threshold) dfs.push({ token, df });
+        let df = row?.doc ?? 0;
+
+        // Porter stem mismatch: if the surface form shows df=0, the tokenizer
+        // may have stored a shorter stem. Check common suffix-stripped forms
+        // so we don't treat stems like "star" (190k docs) as ultra-rare just
+        // because the surface form "stars" isn't in the vocab.
+        if (df === 0) {
+          df = this.lookupStemDf(token) ?? 0;
+        }
+
+        if (df <= threshold) {
+          rare.push({ token, df });
+        } else {
+          common.push({ token, df });
+        }
       } catch {
         // Vocab table doesn't exist (pre-v5 DB) — bail out and keep all tokens
         // so we don't silently degrade recall.
@@ -465,9 +809,73 @@ export class RetrievalService {
         break;
       }
     }
-    if (!vocabAvailable) return tokens;
-    dfs.sort((a, b) => a.df - b.df);
-    return dfs.slice(0, CHUNK_TOKEN_BUDGET).map(d => d.token);
+
+    if (!vocabAvailable) return { survivors: tokens, dropped: [] };
+
+    rare.sort((a, b) => a.df - b.df);
+    common.sort((a, b) => a.df - b.df);
+
+    const survivors = rare.slice(0, CHUNK_TOKEN_BUDGET).map(d => d.token);
+    const droppedTokens = common.map(d => d.token);
+
+    // Zero-token fallback: every token exceeded the rarity threshold. Use the
+    // top-2 least-rare dropped tokens so BM25 has some discriminating signal
+    // rather than returning an empty query (which retrieves nothing from FTS).
+    if (survivors.length === 0 && droppedTokens.length > 0) {
+      return {
+        survivors: droppedTokens.slice(0, 2),
+        dropped: droppedTokens.slice(2),
+      };
+    }
+
+    return { survivors, dropped: droppedTokens };
+  }
+
+  // Lookup the DF for common English suffix-stripped forms of a token.
+  // Used to detect Porter stem mismatches when the surface form has df=0 in
+  // the fts5vocab. Returns the highest DF found across stripped candidates,
+  // or 0 if no candidate matches.
+  private lookupStemDf(token: string): number {
+    const t = token.toLowerCase();
+    const candidates: string[] = [];
+    if (t.length > 4 && t.endsWith('s'))   candidates.push(t.slice(0, -1));
+    if (t.length > 5 && t.endsWith('es'))  candidates.push(t.slice(0, -2));
+    if (t.length > 5 && t.endsWith('ed'))  candidates.push(t.slice(0, -2));
+    if (t.length > 6 && t.endsWith('ing')) candidates.push(t.slice(0, -3));
+    if (t.length > 5 && t.endsWith('ly'))  candidates.push(t.slice(0, -2));
+    if (t.length > 5 && t.endsWith('er'))  candidates.push(t.slice(0, -2));
+    let maxDf = 0;
+    for (const c of candidates) {
+      try {
+        const row = this.db.query<{ doc: number }>(
+          `SELECT doc FROM chunks_fts_vocab WHERE term = ?`, [c]
+        )[0];
+        const df = row?.doc ?? 0;
+        if (df > maxDf) maxDf = df;
+      } catch { /* skip */ }
+    }
+    return maxDf;
+  }
+
+  // Minimum-indexed chunk gate for the game-scoped supplementary BM25 pass.
+  // Cached for 5 minutes; games' chunk counts grow during indexing but don't
+  // change at query time, so stale reads are fine.
+  private gameChunkCache = new Map<string, { n: number; at: number }>();
+
+  private gameChunkCount(gameId: string): number {
+    const cached = this.gameChunkCache.get(gameId);
+    if (cached && Date.now() - cached.at < 300_000) return cached.n;
+    try {
+      const row = this.db.query<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM chunks c JOIN guides g ON g.id = c.guide_id WHERE g.game_id = ?`,
+        [gameId]
+      )[0];
+      const n = row?.n ?? 0;
+      this.gameChunkCache.set(gameId, { n, at: Date.now() });
+      return n;
+    } catch {
+      return 0;
+    }
   }
 
   private cachedChunkTotal: number | null = null;
@@ -517,8 +925,12 @@ export class RetrievalService {
   // different game) muddying the result. If only "diablo 2" matches, that's
   // the intended target.
   private defaultGameMatch(question: string): string[] {
+    return this.defaultGameMatchDetailed(question).ids;
+  }
+
+  private defaultGameMatchDetailed(question: string): GameMatchResult {
     const tokens = extractGameMatchTokens(question);
-    if (tokens.length < GAME_MATCH_NGRAM_MIN) return [];
+    if (tokens.length < GAME_MATCH_NGRAM_MIN) return { ids: [], phraseTokens: [], confidence: 'none' };
 
     // Walk longest-first; within each length, RIGHT-to-left. The shape of
     // these questions ("how do I beat X in <Game Name>?") puts the game
@@ -541,25 +953,42 @@ export class RetrievalService {
         const variants = numeralAliasVariants(ngramTokens);
         for (const variant of variants) {
           const ids = this.queryGamesFtsPhrase(variant);
-          if (ids.length > 0) return ids;
+          if (ids.length > 0) {
+            return {
+              ids,
+              phraseTokens: variant,
+              confidence: classifyGameMatchConfidence(tokens, variant),
+            };
+          }
         }
       }
     }
-    return [];
+    return { ids: [], phraseTokens: [], confidence: 'none' };
   }
 
   private queryGamesFtsPhrase(phraseTokens: string[]): string[] {
     // FTS5 phrase syntax: "word1 word2 word3" matches contiguous tokens.
     // Quote individual tokens to neutralize accidental keyword shape, then
     // wrap the whole thing as a phrase.
-    const phrase = phraseTokens.map(t => t.replace(/"/g, '')).join(' ');
+    const cleanedPhrase = phraseTokens.map(t => t.replace(/"/g, ''));
+    const phrase = cleanedPhrase.join(' ');
     if (!phrase) return [];
     try {
-      const rows = this.db.query<{ game_id: string }>(
-        `SELECT game_id FROM games_fts WHERE games_fts MATCH ? ORDER BY rank LIMIT 16`,
+      const rows = this.db.query<{ game_id: string; title: string }>(
+        `SELECT game_id, title FROM games_fts WHERE games_fts MATCH ? ORDER BY rank LIMIT 16`,
         [`"${phrase}"`]
       );
-      return rows.map(r => r.game_id);
+      // Post-filter: the matched title minus the phrase tokens must consist
+      // only of "decoration" tokens (series brand words, edition suffixes).
+      // Without this, the FTS phrase match also returns titles where the
+      // phrase is a strict substring of a *different* game — e.g. phrase
+      // "super mario 64" matches "Super Mario 64 DS" (different game),
+      // "final fantasy vii" matches "Crisis Core Final Fantasy VII" and
+      // "Final Fantasy VII Advent Children" (different games / spinoffs).
+      // See RETRIEVAL_DEBUG.md "Step 3" for the live-data analysis.
+      return rows
+        .filter(r => passesTitleBoundaryFilter(cleanedPhrase, r.title))
+        .map(r => r.game_id);
     } catch {
       // games_fts may not exist (pre-v5 DB) — silently fall back to no match.
       return [];
@@ -606,6 +1035,134 @@ export class RetrievalService {
 // Exported helper so callers (admin/answer route, AnswerService) can record the
 // embed step's wall time without re-implementing performance.now() bookkeeping.
 export const now = (): number => performance.now();
+
+// Heuristic intent policy used only to steer retrieval filtering aggressiveness.
+// - specific: explicit game extraction succeeded -> enforce hard game gate.
+// - ambiguous: no strong signal either way -> keep softer fallback behavior.
+// - trick/unanswerable: avoid broad retrieval when the prompt is likely a trap.
+export function detectRetrievalIntent(question: string, hasGameMatch: boolean): RetrievalIntent {
+  if (hasGameMatch) return 'specific';
+  for (const rx of TRICK_PATTERNS) {
+    if (rx.test(question)) return 'trick';
+  }
+  for (const rx of UNANSWERABLE_PATTERNS) {
+    if (rx.test(question)) return 'unanswerable';
+  }
+  return 'ambiguous';
+}
+
+function classifyGameMatchConfidence(questionTokens: string[], phraseTokens: string[]): GameMatchConfidence {
+  if (phraseTokens.length === 0) return 'none';
+  if (phraseTokens.length >= 3) return 'high';
+  if (phraseTokens.length === 2) return 'medium';
+
+  const token = phraseTokens[0];
+  if (token.length < MIN_1GRAM_LEN) return 'low';
+  if (LOW_SIGNAL_SINGLE_TOKENS.has(token)) return 'low';
+  const idx = questionTokens.indexOf(token);
+  if (idx > 0 && CONTEXT_PREPOSITIONS.has(questionTokens[idx - 1])) return 'high';
+  return 'medium';
+}
+
+// Tokens that are allowed to surround the matched phrase in a game title
+// without invalidating the match. Two categories:
+//   - Connectives / articles: harmless filler ("the", "of", "and", "&")
+//   - Series-brand words: present in series titles but don't disambiguate
+//     installments (e.g., "legend"/"zelda" prefixing every Zelda title;
+//     "tales", "tales of", "star ocean")
+//   - Edition / version / re-release suffixes: HD, Remake, Anniversary,
+//     Edition, Director's Cut, etc. — different print of the same game
+//
+// Platform identifiers (PC, DS, PS2 …) are intentionally NOT included here.
+// When they appear bare in a title ("Super Mario 64 DS", "Tetris DS") they
+// ARE part of the game's distinct identity and should reject the match.
+// When they appear in parentheses ("Portal (PC)", "Final Fantasy X (PS2)")
+// they are stripped by `passesTitleBoundaryFilter` before tokenisation, so
+// they never reach this check. See the stripping logic in that function.
+//
+// Curated to fix observed mis-matches; intentionally conservative. Adding a
+// token here loosens the filter (more matches), removing one tightens it.
+// Maintain by watching live mis-extractions in RETRIEVAL_DEBUG.md.
+//
+// Exported for tests.
+export const TITLE_DECORATION_TOKENS = new Set([
+  // Connectives / articles
+  'the', 'of', 'and', 'an', 'a',
+  // Series brand words (head-of-title)
+  'legend', 'zelda', 'tales', 'star', 'ocean',
+  // Edition / version / re-release suffixes (tail-of-title)
+  'hd', 'remake', 'remaster', 'remastered', 'anniversary', 'collection',
+  'edition', 'version', 'special', 'greatest', 'hits', 'ultimate',
+  'definitive', 'complete', 'deluxe', 'collectors', 'collector', 'classic',
+  'enhanced', 'plus', 'goty', 'directors', 'cut', 'master', 'quest',
+  'rebirth', 'reborn', 'redux', 'redone', 'revisited', 'international',
+]);
+
+// Strip punctuation, collapse whitespace, lowercase, split on whitespace.
+// Mirrors the FTS5 unicode61 tokenizer closely enough for the post-filter:
+// FTS5 splits on punctuation, our filter tokenizes the title the same way
+// before checking for the phrase substring.
+function normalizeTitleTokens(title: string): string[] {
+  return title
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter(t => t.length > 0);
+}
+
+// Find a contiguous occurrence of `needle` in `haystack`. Returns the start
+// index, or -1 if absent. We compare token-by-token (case-insensitive — both
+// sides come from `normalizeTitleTokens` or `extractGameMatchTokens`, which
+// already lowercase).
+function findContiguousTokenMatch(haystack: string[], needle: string[]): number {
+  if (needle.length === 0 || needle.length > haystack.length) return -1;
+  outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+// Title-boundary filter for game-match. Returns true if the phrase, when
+// found inside the title, leaves only decoration tokens on either side.
+//
+// Parenthetical platform suffixes — "(PC)", "(PS2)", "(GameCube)" — are
+// stripped from the title BEFORE tokenisation. They are purely a GameFAQs
+// cataloguing artefact and must not prevent "portal" from matching
+// "Portal (PC)" or "final fantasy x" from matching "Final Fantasy X (PS2)".
+// By contrast, bare platform tokens that are part of the actual game name
+// ("Super Mario 64 DS", "Tetris DS") are NOT stripped and correctly reject
+// the match — they are distinct titles, not platform-tagged copies.
+//
+// Examples (phrase tokens lowercased):
+//   ['final','fantasy','vii']  vs "Final Fantasy VII"          → true (head=[], tail=[])
+//   ['final','fantasy','vii']  vs "Final Fantasy VII (PS)"     → true (parens stripped)
+//   ['final','fantasy','vii']  vs "Crisis Core Final Fantasy VII" → false (head=['crisis','core'])
+//   ['final','fantasy','vii']  vs "Final Fantasy VII Advent Children" → false (tail=['advent','children'])
+//   ['super','mario','64']     vs "Super Mario 64 DS"          → false (tail=['ds'], bare — not stripped)
+//   ['portal']                 vs "Portal (PC)"                → true (parens stripped → "Portal")
+//   ['pokemon','red']          vs "Pokemon Red Version"        → true (tail=['version'] — decoration)
+//   ['ocarina','of','time']    vs "The Legend of Zelda: Ocarina of Time" → true (all head decoration)
+//   ['diablo']                 vs "Diablo II"                  → false (tail=['ii'])
+//
+// Exported for tests.
+export function passesTitleBoundaryFilter(phraseTokens: string[], title: string): boolean {
+  // Strip parenthetical suffixes like " (PC)", " (PS2 Version)" before
+  // tokenising. These are platform annotations added by GameFAQs, not part of
+  // the game's actual name, and should never invalidate a phrase match.
+  const strippedTitle = title.replace(/\s*\([^)]*\)/g, '').trim();
+  const titleTokens = normalizeTitleTokens(strippedTitle || title);
+  const phrase = phraseTokens.map(t => t.toLowerCase());
+  const start = findContiguousTokenMatch(titleTokens, phrase);
+  if (start < 0) return false; // FTS already guaranteed match; defensive.
+  const head = titleTokens.slice(0, start);
+  const tail = titleTokens.slice(start + phrase.length);
+  for (const t of head) if (!TITLE_DECORATION_TOKENS.has(t)) return false;
+  for (const t of tail) if (!TITLE_DECORATION_TOKENS.has(t)) return false;
+  return true;
+}
 
 // FTS5 reserves a number of characters and bare keywords. Sanitize a raw user
 // question so it can be passed to MATCH without syntax errors and without

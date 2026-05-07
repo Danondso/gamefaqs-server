@@ -5,6 +5,8 @@ import { GameModel } from './models/Game';
 import { EmbeddingService } from './services/EmbeddingService';
 import { SynthesisService } from './services/SynthesisService';
 import { RetrievalService } from './services/RetrievalService';
+import { GameExtractionService } from './services/GameExtractionService';
+import { ProductiveRefusalService } from './services/ProductiveRefusalService';
 import { AnswerService, type AnswerResult } from './services/AnswerService';
 import type { Guide, GuideMetadata, Game } from './types';
 import type { GuideFilters } from './interfaces/IGuideModel';
@@ -33,7 +35,14 @@ const answerService = useRemote ? null : (() => {
     model: config.synthesisModel,
   });
   const retrieval = new RetrievalService({ db: Database, embeddingService: embeddings });
-  return new AnswerService({ retrievalService: retrieval, synthesisService: synthesis });
+  const extractionService = new GameExtractionService(Database, retrieval);
+  const refusalService = new ProductiveRefusalService();
+  return new AnswerService({
+    retrievalService: retrieval,
+    synthesisService: synthesis,
+    extractionService,
+    refusalService,
+  });
 })();
 
 async function api<T>(path: string): Promise<T> {

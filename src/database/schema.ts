@@ -1,7 +1,7 @@
 // SQLite database schema definitions
 // Ported from gamefaqs-reader mobile app
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 11;
 
 export const CREATE_TABLES = {
   guides: `
@@ -25,6 +25,7 @@ export const CREATE_TABLES = {
     CREATE TABLE IF NOT EXISTS games (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
+      canonical_group_id TEXT,
       ra_game_id TEXT UNIQUE,
       platform TEXT,
       completion_percentage REAL DEFAULT 0 CHECK(completion_percentage >= 0 AND completion_percentage <= 100),
@@ -32,7 +33,8 @@ export const CREATE_TABLES = {
       artwork_url TEXT,
       metadata TEXT,
       created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (canonical_group_id) REFERENCES canonical_game_groups(id) ON DELETE SET NULL
     );
   `,
 
@@ -104,19 +106,68 @@ export const CREATE_TABLES = {
     );
   `,
 
-  // Chunks of guide content for retrieval-augmented generation
+  // Chunks of guide content for retrieval-augmented generation.
+  // content_type / section_heading added in migration v11 (chunker v2):
+  // tags each chunk with its dominant content shape ('prose' | 'reference' |
+  // 'mixed') and the nearest preceding section header text. The default
+  // 'prose' on content_type is what makes legacy v1-indexed rows still
+  // queryable with a neutral baseline before they re-index under v2.
   chunks: `
     CREATE TABLE IF NOT EXISTS chunks (
-      id           TEXT PRIMARY KEY,
-      guide_id     TEXT NOT NULL,
-      chunk_index  INTEGER NOT NULL,
-      content      TEXT NOT NULL,
-      char_start   INTEGER NOT NULL,
-      char_end     INTEGER NOT NULL,
-      token_count  INTEGER NOT NULL,
-      created_at   INTEGER NOT NULL,
+      id              TEXT PRIMARY KEY,
+      guide_id        TEXT NOT NULL,
+      chunk_index     INTEGER NOT NULL,
+      content         TEXT NOT NULL,
+      gamefaqs_id     TEXT,
+      franchise       TEXT,
+      language        TEXT,
+      guide_author    TEXT,
+      guide_type      TEXT,
+      review_status   TEXT,
+      char_start      INTEGER NOT NULL,
+      char_end        INTEGER NOT NULL,
+      token_count     INTEGER NOT NULL,
+      created_at      INTEGER NOT NULL,
+      content_type    TEXT NOT NULL DEFAULT 'prose',
+      section_heading TEXT,
       FOREIGN KEY (guide_id) REFERENCES guides(id) ON DELETE CASCADE,
       UNIQUE(guide_id, chunk_index)
+    );
+  `,
+
+  game_aliases: `
+    CREATE TABLE IF NOT EXISTS game_aliases (
+      alias TEXT PRIMARY KEY,
+      game_id TEXT NOT NULL,
+      alias_type TEXT NOT NULL DEFAULT 'manual',
+      confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0 AND confidence <= 1),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      FOREIGN KEY (game_id) REFERENCES games(id) ON DELETE CASCADE
+    );
+  `,
+
+  game_entities: `
+    CREATE TABLE IF NOT EXISTS game_entities (
+      entity TEXT NOT NULL,
+      game_id TEXT NOT NULL,
+      is_unique INTEGER NOT NULL DEFAULT 1 CHECK(is_unique IN (0, 1)),
+      entity_type TEXT NOT NULL DEFAULT 'character',
+      confidence REAL NOT NULL DEFAULT 1.0 CHECK(confidence >= 0 AND confidence <= 1),
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (entity, game_id),
+      FOREIGN KEY (game_id) REFERENCES games(id) ON DELETE CASCADE
+    );
+  `,
+
+  canonical_game_groups: `
+    CREATE TABLE IF NOT EXISTS canonical_game_groups (
+      id TEXT PRIMARY KEY,
+      normalized_title TEXT NOT NULL UNIQUE,
+      display_title TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
     );
   `,
 };
@@ -144,6 +195,10 @@ export const CREATE_INDEXES = {
   guide_tags_tag: 'CREATE INDEX IF NOT EXISTS idx_guide_tags_tag ON guide_tags(tag);',
   // RAG indexes
   chunks_guide_id: 'CREATE INDEX IF NOT EXISTS idx_chunks_guide_id ON chunks(guide_id);',
+  game_aliases_game_id: 'CREATE INDEX IF NOT EXISTS idx_game_aliases_game_id ON game_aliases(game_id);',
+  game_entities_entity: 'CREATE INDEX IF NOT EXISTS idx_game_entities_entity ON game_entities(entity);',
+  game_entities_game_id: 'CREATE INDEX IF NOT EXISTS idx_game_entities_game_id ON game_entities(game_id);',
+  games_canonical_group_id: 'CREATE INDEX IF NOT EXISTS idx_games_canonical_group_id ON games(canonical_group_id);',
 };
 
 // DDL for the RAG chunk-level search infrastructure. Vectors live in the ANN
@@ -187,6 +242,58 @@ export const GAMES_FTS_DDL = {
     CREATE TRIGGER IF NOT EXISTS games_fts_delete AFTER DELETE ON games
     BEGIN
       DELETE FROM games_fts WHERE game_id = old.id;
+    END;
+  `,
+};
+
+// Migration v6 rebuild of guides_fts_meta triggers. Indexes the *canonical*
+// game title (from `games.title` via FK lookup) instead of `guides.title`.
+//
+// Why: after the v5 title relabel, `guides.title` is `${games.title} — ${author}`
+// for guides with a clean author. That puts author tokens into the title-FTS
+// index — and authors are sometimes named "Sephiroth", "Cloud", "Diablo", so
+// title-FTS surfaces unrelated guides on FF7 / Diablo questions. Indexing the
+// game title (without author) eliminates the leak. Display-side `guide_title`
+// in citations still comes from `guides.title` and keeps the author for
+// disambiguation between multiple guides for the same game.
+//
+// We include a `games_fts_meta_propagate_title` trigger so renaming a game
+// (rare — usually only on import correction) refreshes the FTS rows for all
+// linked guides.
+export const TITLE_FTS_V6 = {
+  guides_fts_meta_insert: `
+    CREATE TRIGGER IF NOT EXISTS guides_fts_meta_insert AFTER INSERT ON guides
+    BEGIN
+      INSERT INTO guides_fts_meta(guide_id, title, tags)
+      VALUES (
+        new.id,
+        COALESCE((SELECT title FROM games WHERE id = new.game_id), new.title),
+        COALESCE(json_extract(new.metadata, '$.tags'), '')
+      );
+    END;
+  `,
+
+  guides_fts_meta_update: `
+    CREATE TRIGGER IF NOT EXISTS guides_fts_meta_update AFTER UPDATE ON guides
+    WHEN old.title != new.title
+      OR old.metadata IS NOT new.metadata
+      OR old.game_id IS NOT new.game_id
+    BEGIN
+      UPDATE guides_fts_meta SET
+        title = COALESCE((SELECT title FROM games WHERE id = new.game_id), new.title),
+        tags = COALESCE(json_extract(new.metadata, '$.tags'), '')
+      WHERE guide_id = new.id;
+    END;
+  `,
+
+  // Keep guides_fts_meta in sync when a game's title changes after import.
+  // Updates every guide row that references the renamed game.
+  games_title_propagate: `
+    CREATE TRIGGER IF NOT EXISTS games_title_propagate_to_guides_fts
+    AFTER UPDATE OF title ON games
+    BEGIN
+      UPDATE guides_fts_meta SET title = new.title
+      WHERE guide_id IN (SELECT id FROM guides WHERE game_id = new.id);
     END;
   `,
 };

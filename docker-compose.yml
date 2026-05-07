@@ -44,9 +44,9 @@ services:
       # the container can reach it via host-gateway.
       - OLLAMA_HOST=http://host.docker.internal:11434
       - OLLAMA_MODEL=qwen3:latest # set your default here, you can change it in the admin panel
-      # RAG synthesis: model that takes retrieved chunks + question and writes
-      # the answer. Override via SYNTHESIS_MODEL.
-      - SYNTHESIS_MODEL=granite4
+      # RAG synthesis — override via SYNTHESIS_MODEL (default: qwen3 30B instruct Q4_K_M).
+      - SYNTHESIS_MODEL=${SYNTHESIS_MODEL:-qwen3:30b-a3b-instruct-2507-q4_K_M}
+      - ANSWER_RATE_LIMIT=40
     healthcheck:
       test:
         [

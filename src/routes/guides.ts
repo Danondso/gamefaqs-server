@@ -3,6 +3,8 @@ import DefaultGuideModel from '../models/Guide';
 import { config } from '../config';
 import type { IGuideModel, GuideFilters } from '../interfaces/IGuideModel';
 import type { AnswerService } from '../services/AnswerService';
+import type { RetrievalService } from '../services/RetrievalService';
+import type { SessionContextService } from '../services/SessionContextService';
 import { createSlidingWindowRateLimiter } from '../middleware/rateLimit';
 
 export interface GuidesRouterDeps {
@@ -10,6 +12,10 @@ export interface GuidesRouterDeps {
   // Optional: tests and the legacy default export can omit this. When omitted,
   // POST /answer responds with 503 ("answer service not configured").
   answerService?: AnswerService;
+  sessionContextService?: SessionContextService;
+  // TEMP DEBUG: optional, enables POST /_debug_retrieve for diagnosing
+  // per-source retrieval behavior. Remove with the route.
+  retrievalService?: RetrievalService;
 }
 
 /**
@@ -28,7 +34,7 @@ function sanitizeContentDispositionFilename(filename: string): string {
 
 export function createGuidesRouter(deps: GuidesRouterDeps): Router {
   const router = Router();
-  const { guideModel, answerService } = deps;
+  const { guideModel, answerService, retrievalService, sessionContextService } = deps;
 
   // Sliding-window rate limiter, scoped to /answer only (other guide endpoints
   // are unaffected). Per-router instance so each test app gets its own store.
@@ -42,7 +48,7 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
   // the :id handler.
   router.post('/answer', answerRateLimiter, async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const { question, game_id, platform, genre, tags, tag_match, top_k } = req.body ?? {};
+      const { question, game_id, platform, genre, tags, tag_match, top_k, session_id, clear_context } = req.body ?? {};
 
       if (typeof question !== 'string' || question.trim().length === 0) {
         res.status(400).json({ error: 'question is required' });
@@ -80,6 +86,14 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
         }
         topK = top_k;
       }
+      if (session_id !== undefined && typeof session_id !== 'string') {
+        res.status(400).json({ error: 'session_id must be a string' });
+        return;
+      }
+      if (clear_context !== undefined && typeof clear_context !== 'boolean') {
+        res.status(400).json({ error: 'clear_context must be a boolean' });
+        return;
+      }
 
       if (!answerService) {
         res.status(503).json({ error: 'Answer service not configured' });
@@ -87,11 +101,24 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
       }
 
       try {
+        const sessionId = typeof session_id === 'string' && session_id.trim() ? session_id.trim() : undefined;
+        if (clear_context && sessionId && sessionContextService) {
+          sessionContextService.clear(sessionId);
+        }
+        const ctx = sessionId && sessionContextService ? sessionContextService.get(sessionId) : undefined;
         const result = await answerService.answer(
           question.trim(),
           { gameId: game_id, platform, genre, tags, tagMatch: tag_match },
-          topK
+          topK,
+          { establishedGameId: ctx?.establishedGameId, recentTurns: ctx?.turns }
         );
+        if (sessionId && sessionContextService) {
+          sessionContextService.appendTurn(sessionId, { role: 'user', text: question.trim() });
+          sessionContextService.appendTurn(sessionId, { role: 'assistant', text: result.answer });
+          if (result.extraction.status === 'confident') {
+            sessionContextService.setGame(sessionId, result.extraction.gameId);
+          }
+        }
         res.json(result);
       } catch (err: any) {
         // Distinguish embedding-host failures from synthesis-host failures so
@@ -109,6 +136,26 @@ export function createGuidesRouter(deps: GuidesRouterDeps): Router {
       }
     } catch (error) {
       next(error);
+    }
+  });
+
+  // TEMP DEBUG: per-source retrieval inspection. No fusion, no synth.
+  // Body: { question: string, k?: number }
+  router.post('/_debug_retrieve', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (!retrievalService) {
+        res.status(503).json({ error: 'retrieval service not configured' });
+        return;
+      }
+      const { question, k } = req.body ?? {};
+      if (typeof question !== 'string' || !question.trim()) {
+        res.status(400).json({ error: 'question is required' });
+        return;
+      }
+      const out = await retrievalService.debugSources(question.trim(), typeof k === 'number' ? k : 20);
+      res.json(out);
+    } catch (err) {
+      next(err);
     }
   });
 

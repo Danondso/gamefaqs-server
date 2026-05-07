@@ -9,13 +9,14 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "rag:bench": "RAG_BENCH=1 vitest run tests/benchmarks/rag-accuracy.test.ts --reporter=verbose --testTimeout=200000",
-    "docker:build": "docker build -t gamefaqs-server .",
+    "rag:bench": "RAG_BENCH=1 RAG_BENCH_OUTPUT_FILE=bench-qa.txt RAG_BENCH_DELAY_MS=250 vitest run tests/benchmarks/rag-accuracy.test.ts --reporter=verbose --testTimeout=200000",
+    "chunks:validate": "ts-node src/tools/chunkValidationCli.ts",
+    "docker:build": "docker build -t gamefaqs-server . && docker image prune -f",
     "docker:run": "docker-compose up",
     "mcp": "ts-node src/mcp-server.ts",
     "mcp:start": "node dist/mcp-server.js",
     "mcp:bundle": "esbuild src/mcp-server.ts --bundle --platform=node --target=node20 --format=cjs --external:better-sqlite3 --external:usearch --outfile=dist/mcp-server.js",
-    "docker:mcp:build": "docker build -f Dockerfile.mcp -t gamefaqs-mcp ."
+    "docker:mcp:build": "docker build -f Dockerfile.mcp -t gamefaqs-mcp . && docker image prune -f"
   },
   "keywords": [],
   "author": "",
