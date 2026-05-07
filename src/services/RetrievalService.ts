@@ -520,7 +520,22 @@ export class RetrievalService {
     // Expand title hits → chunks. Every chunk in a title-matched guide enters
     // RRF at that guide's title rank, so all chunks of the top-titled guide
     // get the same boost; vec/FTS pick the best chunk within.
-    const titleChunkHits = this.expandTitleHitsToChunks(titleHits);
+    let titleChunkHits = this.expandTitleHitsToChunks(titleHits);
+
+    // Title-FTS as re-ranker (Bug fix-6): when title-FTS would flood thousands
+    // of chunks per matched guide, the alphabetical/insertion order of those
+    // chunks dominates RRF in the absence of vec/FTS evidence — surfacing the
+    // guide's TOC / version-history / front-matter chunks above the actual
+    // answer chunks. Restrict title-source to chunks that ALSO appear in
+    // vec or FTS hits (title-FTS becomes a boost, not a candidate generator).
+    // The intersection is non-empty in practice because vec is a corpus-wide
+    // KNN that almost always lights up SOME chunks of a title-matched guide.
+    if (titleChunkHits.length > 0) {
+      const evidenceIds = new Set<string>();
+      for (const h of vecHits) evidenceIds.add(h.chunk_id);
+      for (const h of ftsHits) evidenceIds.add(h.chunk_id);
+      titleChunkHits = titleChunkHits.filter(h => evidenceIds.has(h.chunk_id));
+    }
 
     // Apply explicit filters (gameId/platform/genre/tags) before fusion so RRF
     // rank reflects post-filter ordering.
