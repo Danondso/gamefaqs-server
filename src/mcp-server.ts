@@ -5,6 +5,8 @@ import { GameModel } from './models/Game';
 import { EmbeddingService } from './services/EmbeddingService';
 import { SynthesisService } from './services/SynthesisService';
 import { RetrievalService } from './services/RetrievalService';
+import { GameExtractionService } from './services/GameExtractionService';
+import { ProductiveRefusalService } from './services/ProductiveRefusalService';
 import { AnswerService, type AnswerResult } from './services/AnswerService';
 import type { Guide, GuideMetadata, Game } from './types';
 import type { GuideFilters } from './interfaces/IGuideModel';
@@ -33,7 +35,14 @@ const answerService = useRemote ? null : (() => {
     model: config.synthesisModel,
   });
   const retrieval = new RetrievalService({ db: Database, embeddingService: embeddings });
-  return new AnswerService({ retrievalService: retrieval, synthesisService: synthesis });
+  const extractionService = new GameExtractionService(Database, retrieval);
+  const refusalService = new ProductiveRefusalService();
+  return new AnswerService({
+    retrievalService: retrieval,
+    synthesisService: synthesis,
+    extractionService,
+    refusalService,
+  });
 })();
 
 async function api<T>(path: string): Promise<T> {
@@ -244,7 +253,7 @@ async function main() {
   // --- Tool: search_guides ---
   server.tool(
     'search_guides',
-    'Search game guides and FAQs by keyword (FTS5 over titles, tags, and full content). Returns guide summaries — NOT full guide text. Each result includes an opaque `id` field (e.g. "1CfMYpdTs-Mjti1XBYTLx"); to read a guide, pass that exact `id` value to read_guide as `guide_id`. Do not modify, shorten, or fabricate IDs from titles or filenames — they will 404.',
+    'Search game guides and FAQs by keyword (FTS5 over titles, tags, and full content). Returns guide summaries — NOT full guide text. Each result includes an opaque random-string `id` field; to read a guide, pass that exact `id` value to read_guide as `guide_id`. IDs are only ever obtained from a previous tool response — never invent, guess, modify, shorten, or copy them from documentation or examples. Fabricated IDs will 404.',
     {
       query: z.string().describe('Search query (supports FTS5 syntax: AND, OR, NOT, "phrase", prefix*)'),
       limit: z.number().min(1).max(50).default(20).describe('Max results to return'),
@@ -294,7 +303,7 @@ async function main() {
   // --- Tool: search_games ---
   server.tool(
     'search_games',
-    'Search games by title (partial match). Returns matching games with metadata. Each result includes an opaque `id` field (e.g. "4eL10FTnMoMaimVOdwL8t"); to fetch full details and the list of guides for that game, pass that exact `id` value to get_game as `game_id`. Do not pass the title or any human-readable name as the ID — only the verbatim `id` returned here. Fabricated IDs will 404.',
+    'Search games by title (partial match). Returns matching games with metadata. Each result includes an opaque random-string `id` field; to fetch full details and the list of guides for that game, pass that exact `id` value to get_game as `game_id`. IDs are only ever obtained from a previous tool response — never invent, guess, or copy them from documentation or examples. Do not pass the title or any human-readable name as the ID. Fabricated IDs will 404.',
     {
       query: z.string().describe('Game title to search for (partial match supported)'),
     },
@@ -328,9 +337,9 @@ async function main() {
   // --- Tool: read_guide ---
   server.tool(
     'read_guide',
-    'Read the content of one specific guide. Guides can be very large; content is returned in chunks (use `offset` to paginate, start with offset=0). Requires the exact `id` of a guide from a prior search_guides, browse_guides, or get_game response. IDs are opaque random strings (e.g. "1CfMYpdTs-Mjti1XBYTLx") — do NOT invent them from titles, filenames, platforms, or any human-readable convention. If you do not already have a real ID, call search_guides first. Do NOT pass the `length` parameter — let it default to 8000. Smaller chunks force many round trips and slow the conversation dramatically.',
+    'Read the content of one specific guide. Guides can be very large; content is returned in chunks (use `offset` to paginate, start with offset=0). Requires the exact `id` of a guide from a prior search_guides, browse_guides, or get_game response. IDs are opaque random strings — do NOT invent them from titles, filenames, platforms, any human-readable convention, or any example shown in documentation. If you do not already have a real ID from a prior tool response in this conversation, call search_guides first. Do NOT pass the `length` parameter — let it default to 8000. Smaller chunks force many round trips and slow the conversation dramatically.',
     {
-      guide_id: z.string().describe('Exact `id` value copied verbatim from a previous search_guides, browse_guides, or get_game tool response. Opaque random string like "1CfMYpdTs-Mjti1XBYTLx". Never fabricate.'),
+      guide_id: z.string().describe('Exact opaque random-string `id` value copied verbatim from a previous search_guides, browse_guides, or get_game tool response in this conversation. Never fabricate; never copy from documentation or examples.'),
       offset: z.number().min(0).default(0).describe('Character offset to start reading from. Use 0 on the first call, then pass the `next_offset` value from the previous response.'),
       length: z.number().min(4000).max(50000).default(8000).describe('Number of characters to return. Leave unset to use the default of 8000 — do not pass small values, they only multiply the number of round trips needed.'),
     },
@@ -370,9 +379,9 @@ async function main() {
   // --- Tool: get_game ---
   server.tool(
     'get_game',
-    'Get detailed information about a specific game and the list of guides associated with it. Requires the exact `id` of a game from a prior search_games response. IDs are opaque random strings (e.g. "4eL10FTnMoMaimVOdwL8t") — do NOT pass the title, platform, or any human-readable name. If you do not already have a real ID, call search_games first.',
+    'Get detailed information about a specific game and the list of guides associated with it. Requires the exact `id` of a game from a prior search_games response. IDs are opaque random strings — do NOT pass the title, platform, any human-readable name, or any example shown in documentation. If you do not already have a real ID from a prior tool response in this conversation, call search_games first.',
     {
-      game_id: z.string().describe('Exact `id` value copied verbatim from a previous search_games tool response. Opaque random string like "4eL10FTnMoMaimVOdwL8t". Never fabricate from titles or filenames.'),
+      game_id: z.string().describe('Exact opaque random-string `id` value copied verbatim from a previous search_games tool response in this conversation. Never fabricate from titles or filenames; never copy from documentation or examples.'),
     },
     async ({ game_id }) => {
       const game = await dsGetGame(game_id);
@@ -453,10 +462,10 @@ async function main() {
   // --- Tool: answer_question ---
   server.tool(
     'answer_question',
-    'Answer a natural-language question ("how do I beat the Lich?", "where is the master sword?", "what platforms is FF7 on?") by retrieving relevant chunks from across the GameFAQs archive and synthesizing a cited answer. Returns `{ answer, no_answer, citations, timing_ms }`. Each citation includes a real `guide_id` (opaque, e.g. "1CfMYpdTs-Mjti1XBYTLx") and `chunk_id`; the `guide_id` can be passed verbatim to read_guide for the full source. CRITICAL RULES: (1) If `no_answer` is true OR the answer equals "I don\'t have that information in the available guides.", the archive does not contain the answer — DO NOT fabricate one from your own training data; tell the user the archive lacks coverage and suggest they try search_guides with different keywords. (2) Always preserve the bracketed citation markers ([1], [2], etc.) when relaying the answer — they map to the citations array by 1-based index. (3) Use this tool for question-style queries; use search_guides for keyword exploration and browse_guides for filter-based enumeration. (4) `game_id`, when provided, MUST be an opaque ID from a prior search_games response — do not invent it from a title.',
+    'Answer a natural-language question ("how do I beat the Lich?", "where is the master sword?", "what platforms is FF7 on?") by retrieving relevant chunks from across the GameFAQs archive and synthesizing a cited answer. Returns `{ answer, no_answer, citations, timing_ms }`. Each citation includes a real opaque `guide_id` and `chunk_id`; the `guide_id` can be passed verbatim to read_guide for the full source. CRITICAL RULES: (1) If `no_answer` is true OR the answer equals "I don\'t have that information in the available guides.", the archive does not contain the answer — DO NOT fabricate one from your own training data; tell the user the archive lacks coverage and suggest they try search_guides with different keywords. Do not retry the same question with the same filters. (2) Always preserve the bracketed citation markers ([1], [2], etc.) when relaying the answer — they map to the citations array by 1-based index. (3) Use this tool for question-style queries; use search_guides for keyword exploration and browse_guides for filter-based enumeration. (4) OMIT `game_id` entirely unless you have a real one from a prior search_games response in this conversation — passing a fabricated game_id filters retrieval down to nothing and wastes 20+ seconds returning no_answer. NEVER copy IDs from documentation or examples.',
     {
       question: z.string().min(1).max(1000).describe('The natural-language question to answer. Max 1000 characters. Phrase it as a question or instruction ("how do I X", "where is Y") — keyword strings work poorly here; use search_guides for those.'),
-      game_id: z.string().optional().describe('Optional: restrict retrieval to chunks from guides linked to this game. Must be an opaque `id` from a prior search_games response (e.g. "4eL10FTnMoMaimVOdwL8t"). Never fabricate from titles.'),
+      game_id: z.string().optional().describe('Optional: restrict retrieval to chunks from guides linked to this game. MUST be an opaque random-string `id` from a prior search_games response in this conversation. OMIT this field entirely if you do not have such an ID — do not pass titles, names, or example values from documentation. A fabricated game_id will return no_answer after a slow filtered retrieval.'),
       platform: z.string().optional().describe('Optional: restrict retrieval to chunks from guides whose metadata.platform matches this string exactly (e.g. "PlayStation 2", "Game Boy Advance"). Use the values returned by get_archive_stats.guide_platforms.'),
       genre: z.string().optional().describe('Optional: restrict retrieval to guides whose metadata.genre matches this string exactly (e.g. "JRPG", "FPS"). Sourced from AI analysis; not all guides have it set.'),
       tags: z.array(z.string()).optional().describe('Optional: restrict retrieval to guides tagged with these values. Use values returned by get_archive_stats.tags.'),

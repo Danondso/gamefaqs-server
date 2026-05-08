@@ -27,6 +27,24 @@ The bench is gated behind `RAG_BENCH=1` so `npm test` skips it. It hits a
 running server (default `http://localhost:3000`); a 5s pace between questions
 keeps the production rate limiter happy.
 
+## Bench infra gotchas
+
+If a bench run shows a cluster of `API 503` failures with answers that never
+made it to synthesis, it's almost always Ollama VRAM contention, not a
+retrieval regression. The 30B synthesis model pins ~31 GB on a 32 GB GPU;
+loading `nomic-embed-text` for the question's vector lookup hits CUDA OOM.
+
+`docker-compose.yml` defaults `EMBEDDING_MODEL` to `nomic-embed-text-cpu:latest`
+— a CPU-pinned tag (`PARAMETER num_gpu 0`) of the same blob (so the ANN
+index stays valid). Embeds run on CPU at ~200ms each, freeing VRAM for the
+synthesis model to stay resident across the bench run. Don't switch the
+embedder to a GPU tag unless you've also moved synthesis off the same card.
+
+Errors at the embedding/synthesis boundary are now logged before the route
+downgrades them to a 503 (`src/routes/guides.ts`); look for
+`[Answer] embedding error: ...` / `[Answer] synthesis error: ...` in the
+container logs to see the upstream message.
+
 ## What gets measured
 
 Each question is tagged with a `kind` that drives its assertion:

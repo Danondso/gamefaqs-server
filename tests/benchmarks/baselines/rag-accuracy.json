@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-05-04T15:20:23.292Z",
+  "generated_at": "2026-05-07T13:26:02.485Z",
   "recall_floor_used": 0.55,
   "questions": [
     {
       "question": "How do I beat Sephiroth in Final Fantasy VII?",
       "kind": "specific",
       "passed": true,
-      "matched_title": "Final Fantasy VII Advent Children",
-      "no_answer": true,
-      "keyword_hits": 0
+      "matched_title": "Final Fantasy VII — DynamixDJ",
+      "no_answer": false,
+      "keyword_hits": 1
     },
     {
       "question": "What is the password for Otacon in Metal Gear Solid 2?",
@@ -22,24 +22,24 @@
     {
       "question": "How do I get the Master Sword in Ocarina of Time?",
       "kind": "specific",
-      "passed": true,
-      "matched_title": "The Legend of Zelda Ocarina of Time Master Quest — slb24680",
-      "no_answer": true,
-      "keyword_hits": 0
-    },
-    {
-      "question": "How do I beat the Elite Four in Pokemon Red?",
-      "kind": "specific",
       "passed": false,
       "matched_title": null,
       "no_answer": true,
       "keyword_hits": 0
     },
     {
-      "question": "How do I beat Krauser in Resident Evil 4?",
+      "question": "How do I beat the Elite Four in Pokemon Red?",
       "kind": "specific",
       "passed": true,
-      "matched_title": "Resident Evil 4",
+      "matched_title": "Pokemon Red Version — KoritheMan",
+      "no_answer": false,
+      "keyword_hits": 1
+    },
+    {
+      "question": "How do I beat Krauser in Resident Evil 4?",
+      "kind": "specific",
+      "passed": false,
+      "matched_title": "Resident Evil 4 — Joe Zakutny",
       "no_answer": true,
       "keyword_hits": 0
     },
@@ -47,23 +47,23 @@
       "question": "How do I get all 120 stars in Super Mario 64?",
       "kind": "specific",
       "passed": true,
-      "matched_title": "Super Mario 64 — Version History",
-      "no_answer": true,
-      "keyword_hits": 0
+      "matched_title": "Super Mario 64",
+      "no_answer": false,
+      "keyword_hits": 1
     },
     {
       "question": "How do I beat Lavos in Chrono Trigger?",
       "kind": "specific",
       "passed": true,
-      "matched_title": "Chrono Trigger",
-      "no_answer": true,
-      "keyword_hits": 0
+      "matched_title": "Chrono Trigger — KoritheMan",
+      "no_answer": false,
+      "keyword_hits": 1
     },
     {
       "question": "How do I beat Kefka in Final Fantasy VI?",
       "kind": "specific",
-      "passed": true,
-      "matched_title": "Final Fantasy VI — FFfanNo1",
+      "passed": false,
+      "matched_title": null,
       "no_answer": true,
       "keyword_hits": 0
     },
@@ -71,17 +71,17 @@
       "question": "How do I find the inverted castle in Castlevania Symphony of the Night?",
       "kind": "specific",
       "passed": true,
-      "matched_title": "Castlevania Symphony of the Night — Version 2.2",
-      "no_answer": true,
-      "keyword_hits": 0
+      "matched_title": "Castlevania Symphony of the Night — Paul Acevedo",
+      "no_answer": false,
+      "keyword_hits": 1
     },
     {
       "question": "How do I get to the secret cow level in Diablo 2?",
       "kind": "specific",
       "passed": true,
-      "matched_title": "Diablo II — Allyourbase (Emmanuel Lopez)",
-      "no_answer": true,
-      "keyword_hits": 0
+      "matched_title": "Diablo II",
+      "no_answer": false,
+      "keyword_hits": 1
     },
     {
       "question": "Who's the first enemy I fight in Final Fantasy X?",
@@ -111,32 +111,32 @@
       "question": "How do I solve the church window puzzle in Resident Evil 4?",
       "kind": "specific",
       "passed": true,
-      "matched_title": "Resident Evil 4 Hd",
-      "no_answer": true,
-      "keyword_hits": 0
+      "matched_title": "Resident Evil 4 — Adnan Javed, better known as",
+      "no_answer": false,
+      "keyword_hits": 1
     },
     {
       "question": "How many stars are in Super Mario 64?",
       "kind": "specific",
       "passed": true,
-      "matched_title": "Super Mario 64 Ds — Alasdair Lo",
-      "no_answer": true,
-      "keyword_hits": 0
+      "matched_title": "Super Mario 64",
+      "no_answer": false,
+      "keyword_hits": 1
     },
     {
       "question": "What is the max level in Diablo 2?",
       "kind": "specific",
-      "passed": true,
-      "matched_title": "Diablo II — Level",
+      "passed": false,
+      "matched_title": "Diablo II",
       "no_answer": true,
       "keyword_hits": 0
     },
     {
       "question": "How many Triforce shards are in Wind Waker?",
       "kind": "specific",
-      "passed": true,
-      "matched_title": "The Legend of Zelda the Wind Waker Hd — Banjo2553",
-      "no_answer": false,
+      "passed": false,
+      "matched_title": null,
+      "no_answer": true,
       "keyword_hits": 0
     },
     {
@@ -150,42 +150,42 @@
     {
       "question": "Who is Solid Snake's father?",
       "kind": "specific",
-      "passed": true,
-      "matched_title": "Metal Gear 2 Solid Snake",
+      "passed": false,
+      "matched_title": null,
       "no_answer": true,
       "keyword_hits": 0
     },
     {
       "question": "What's Aerith's last name?",
       "kind": "specific",
-      "passed": true,
-      "matched_title": "Final Fantasy VII — me,",
+      "passed": false,
+      "matched_title": null,
       "no_answer": true,
       "keyword_hits": 0
     },
     {
       "question": "What's the missingno glitch in Pokemon Red?",
       "kind": "specific",
-      "passed": false,
-      "matched_title": null,
-      "no_answer": true,
-      "keyword_hits": 0
+      "passed": true,
+      "matched_title": "Pokemon Red Version — Xabbott)",
+      "no_answer": false,
+      "keyword_hits": 2
     },
     {
       "question": "How do I do the W-Item duplication trick in Final Fantasy 7?",
       "kind": "specific",
       "passed": true,
-      "matched_title": "Final Fantasy VII Final Fantasy VIII Remastered Twin Pack",
-      "no_answer": true,
-      "keyword_hits": 0
+      "matched_title": "Final Fantasy VII",
+      "no_answer": false,
+      "keyword_hits": 3
     },
     {
       "question": "How does the duplicate item glitch work in Diablo 2?",
       "kind": "specific",
-      "passed": false,
-      "matched_title": null,
-      "no_answer": true,
-      "keyword_hits": 0
+      "passed": true,
+      "matched_title": "Diablo II — Sashanan",
+      "no_answer": false,
+      "keyword_hits": 2
     },
     {
       "question": "What are the cheats for the weapon sets in GTA San Andreas?",
@@ -193,7 +193,7 @@
       "passed": false,
       "matched_title": null,
       "no_answer": true,
-      "keyword_hits": 0
+      "keyword_hits": 2
     },
     {
       "question": "Where do I find the Master Key?",
@@ -201,29 +201,29 @@
       "passed": false,
       "matched_title": null,
       "no_answer": true,
-      "keyword_hits": 0
+      "keyword_hits": 1
     },
     {
       "question": "What is the best starter Pokemon?",
       "kind": "ambiguous",
-      "passed": true,
-      "matched_title": "Pokemon Red Version — and copyright (c) Zerokid 2012-Present",
-      "no_answer": false,
-      "keyword_hits": 1
+      "passed": false,
+      "matched_title": null,
+      "no_answer": true,
+      "keyword_hits": 0
     },
     {
       "question": "How do I learn Ultima?",
       "kind": "ambiguous",
-      "passed": true,
-      "matched_title": "Final Fantasy Tactics — Fritz Fraundorf %",
-      "no_answer": false,
-      "keyword_hits": 1
+      "passed": false,
+      "matched_title": null,
+      "no_answer": true,
+      "keyword_hits": 0
     },
     {
       "question": "How do I beat the final boss in Resident Evil?",
       "kind": "ambiguous",
-      "passed": true,
-      "matched_title": "Resident Evil Archives Resident Evil",
+      "passed": false,
+      "matched_title": "Resident Evil — New-Blood.com & RESitez.com Webmaster Rob McGregor",
       "no_answer": true,
       "keyword_hits": 0
     },
@@ -248,8 +248,8 @@
       "kind": "trick",
       "passed": true,
       "matched_title": null,
-      "no_answer": false,
-      "keyword_hits": 1
+      "no_answer": true,
+      "keyword_hits": 0
     },
     {
       "question": "How do I beat the final boss in Tetris?",
@@ -263,7 +263,7 @@
       "question": "How do I use the secret combo to one-shot Ganon in Breath of the Wild?",
       "kind": "trick",
       "passed": true,
-      "matched_title": "The Legend of Zelda Breath of the Wild — ReyVGM",
+      "matched_title": null,
       "no_answer": true,
       "keyword_hits": 0
     },

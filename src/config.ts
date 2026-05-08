@@ -1,5 +1,3 @@
-import * as path from 'path';
-
 export const config = {
   // Server settings
   port: parseInt(process.env.PORT || '3000', 10),
@@ -38,7 +36,7 @@ export const config = {
   embeddingModel: process.env.EMBEDDING_MODEL || 'nomic-embed-text',
   embeddingDim: parseInt(process.env.EMBEDDING_DIM || '768', 10),
   synthesisHost: process.env.SYNTHESIS_OLLAMA_HOST || process.env.OLLAMA_HOST || 'http://localhost:11434',
-  synthesisModel: process.env.SYNTHESIS_MODEL || 'qwen2.5:7b-instruct',
+  synthesisModel: process.env.SYNTHESIS_MODEL || 'qwen3:30b-a3b-instruct-2507-q4_K_M',
   // Default 400 tokens is intentionally conservative: nomic-embed-text's hard
   // context limit is 2048 tokens, and our chars/4 estimate undercounts BPE for
   // content with lots of CRLF, abbreviations, or stat tables (real density can
@@ -71,8 +69,3 @@ export const config = {
   // CORS: in production, set CORS_ORIGIN to restrict (e.g. "https://app.example.com" or comma-separated list)
   corsOrigin: process.env.CORS_ORIGIN,
 };
-
-// Ensure directories are absolute paths for Docker volumes
-export function ensureAbsolutePath(p: string): string {
-  return path.isAbsolute(p) ? p : path.resolve(process.cwd(), p);
-}

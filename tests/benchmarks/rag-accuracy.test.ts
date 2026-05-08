@@ -44,6 +44,23 @@ const RECALL_FLOOR = parseFloat(process.env.RAG_BENCH_RECALL_FLOOR ?? '0.55');
 // the production rate limiter. Cheaper than chewing through retry budgets on
 // 429s. Default 1s; set 0 to disable.
 const INTER_QUESTION_DELAY_MS = parseInt(process.env.RAG_BENCH_DELAY_MS ?? '5000', 10);
+// Print short citation previews to stderr by default; the bench-qa file carries
+// full per-chunk bodies when the API includes `content`.
+const PRINT_ANSWERS = process.env.RAG_BENCH_PRINT_ANSWERS !== '0';
+const REQUIRE_HARD_GAME_MATCH = process.env.RAG_BENCH_REQUIRE_HARD_GAME_MATCH === '1';
+// Write a human-readable Q&A dump every bench run so results are reviewable
+// without scrolling vitest output. Flushed after each question so interrupts
+// still leave a partial file. Default: ./bench-qa.txt at repo root (git-ignored).
+// Override with RAG_BENCH_OUTPUT_FILE=<path>; set RAG_BENCH_OUTPUT_FILE='' to disable.
+const OUTPUT_FILE_PATH = 'RAG_BENCH_OUTPUT_FILE' in process.env
+  ? process.env.RAG_BENCH_OUTPUT_FILE || null
+  : path.resolve(__dirname, '..', '..', 'bench-qa.txt');
+const outputLines: string[] = [];
+
+function flushBenchQADump(): void {
+  if (!OUTPUT_FILE_PATH || outputLines.length === 0) return;
+  fs.writeFileSync(OUTPUT_FILE_PATH, outputLines.join('\n'), 'utf-8');
+}
 
 // Baseline records per-question expected pass/fail, so a question that passed
 // last run but fails now is flagged loudly even if aggregate recall is fine.
@@ -93,6 +110,13 @@ interface BenchQuestion {
   // synthesized answer. Hard signal for `trick`: at least one keyword present
   // OR no_answer=true counts as "premise corrected."
   expectedAnswerKeywords?: string[];
+  /**
+   * Keywords whose presence in the answer counts as a regression. Used to
+   * catch scenario blending (e.g. NG+ stat thresholds in a plain Lavos
+   * answer) and other "the model dragged in content from the wrong scenario"
+   * failures. Any hit fails the question.
+   */
+  unexpectedAnswerKeywords?: string[];
   notes?: string;
 }
 
@@ -176,6 +200,16 @@ const QUESTIONS: BenchQuestion[] = [
     kind: 'specific',
     expectedTitleRegex: RX_CHRONO,
     expectedAnswerKeywords: ['Lavos'],
+    // The plain question must NOT drag in NG+-only content (Level 60+, Crono's
+    // Rainbow, Nova Armor, the Lucca pod / NG+ early-Lavos trick).
+    unexpectedAnswerKeywords: ['New Game+', 'NG+', 'Rainbow Sword', 'Nova Armor', 'Lucca\'s pod'],
+  },
+  {
+    question: 'How do I beat Lavos early in Chrono Trigger?',
+    kind: 'specific',
+    expectedTitleRegex: RX_CHRONO,
+    expectedAnswerKeywords: ['New Game', 'Lavos'],
+    notes: 'The "early Lavos" fight is NG+-only. The answer SHOULD reference NG+, the Lucca pod trick, or similar gating.',
   },
   {
     question: 'How do I beat Kefka in Final Fantasy VI?',
@@ -364,6 +398,8 @@ interface BenchResult {
   answerKeywordHits: number;
   expectedKeywordCount: number;
   noAnswer: boolean;
+  gameCorrectTop1: boolean | null;
+  hardGameMatch: boolean | null;
   topTitles: string[];
   totalMs: number;
   embedMs: number;
@@ -373,30 +409,67 @@ interface BenchResult {
 
 // Single source of truth for "did this question pass?" — used by both the
 // per-question assertion and the baseline comparison so they can never disagree.
+//
+// `specific` / `ambiguous` pass = right guide cited AND synth actually answered
+// AND (if expected keywords were supplied) the answer hit at least one. Recall
+// alone was misleading: ~58% of recall-hit specific questions still had the
+// synth refuse with no_answer=true, which the user can't tell from the title.
 function computePassed(
   q: BenchQuestion,
   ans: ApiAnswer,
   recallHit: boolean,
-  keywordHits: number
+  keywordHits: number,
+  expectedKeywordCount: number
 ): boolean {
+  // Any unexpected-keyword hit is a regression, regardless of kind.
+  if (countUnexpectedKeywords(ans.answer, q.unexpectedAnswerKeywords) > 0) return false;
+  const productiveRefusal = isProductiveRefusal(ans.answer);
   switch (q.kind) {
     case 'specific':
     case 'ambiguous':
-      return recallHit;
+      return recallHit && !ans.no_answer && (expectedKeywordCount === 0 || keywordHits >= 1);
     case 'unanswerable':
-      return ans.no_answer;
+      return ans.no_answer || productiveRefusal;
     case 'trick':
-      return ans.no_answer || keywordHits >= 1;
+      return ans.no_answer || productiveRefusal || keywordHits >= 1;
   }
+}
+
+// Scope the unexpected-keyword check to the *canonical* portion of the answer.
+// When Rule 20/21 fire correctly the synth sections gated content under an
+// "Alternative approaches" / "New Game+ secret fight" / similar header, which
+// is the desired outcome — those scoped mentions should NOT count as bleed.
+// Only banned keywords that appear before the first such header are flagged.
+const ALT_SECTION_RE = /(?:^|\n)\s*(?:[*_-]{0,2}\s*)(?:Alternative\s+approaches?|Alternatives?|New\s+Game\s*\+\s+(?:secret|fight|version)|Secret\s+(?:fight|version)|Optional\s+fight|Standard\s+fight)\s*[:\-]/i;
+function canonicalAnswerSegment(answer: string): string {
+  const m = ALT_SECTION_RE.exec(answer);
+  return m ? answer.slice(0, m.index) : answer;
+}
+function countUnexpectedKeywords(answer: string, banned: string[] | undefined): number {
+  if (!banned || banned.length === 0) return 0;
+  const lower = canonicalAnswerSegment(answer).toLowerCase();
+  return banned.reduce((n, k) => (lower.includes(k.toLowerCase()) ? n + 1 : n), 0);
+}
+
+function isProductiveRefusal(answer: string): boolean {
+  const lower = answer.toLowerCase();
+  const refusalCue = lower.includes("don't have") || lower.includes("couldn't") || lower.includes('cannot');
+  const followupCue = lower.includes('try ') || lower.includes('ask ') || lower.includes('tell me');
+  return refusalCue && followupCue;
 }
 
 function describeExpectation(q: BenchQuestion): string {
   switch (q.kind) {
     case 'specific':
-    case 'ambiguous':
-      return q.expectedTitleRegex
-        ? `Expected title match: ${q.expectedTitleRegex.toString()}`
-        : `Expected title substring (any of): ${JSON.stringify(q.expectedTitleSubstrings ?? [])}`;
+    case 'ambiguous': {
+      const titlePart = q.expectedTitleRegex
+        ? `title match: ${q.expectedTitleRegex.toString()}`
+        : `title substring (any of): ${JSON.stringify(q.expectedTitleSubstrings ?? [])}`;
+      const kwPart = q.expectedAnswerKeywords?.length
+        ? `, no_answer=false, ≥1 keyword from ${JSON.stringify(q.expectedAnswerKeywords)}`
+        : `, no_answer=false`;
+      return `Expected ${titlePart}${kwPart}`;
+    }
     case 'unanswerable':
       return 'Unanswerable question; expected no_answer=true';
     case 'trick':
@@ -409,6 +482,8 @@ interface ApiCitation {
   guide_title: string;
   chunk_id: string;
   chunk_index: number;
+  /** Full chunk body when the server returns it (same field synthesis uses). */
+  content?: string;
   excerpt: string;
   score: number;
 }
@@ -418,6 +493,57 @@ interface ApiAnswer {
   no_answer: boolean;
   citations: ApiCitation[];
   timing_ms: { embed: number; retrieve: number; synthesize: number; total: number };
+}
+
+/** Preview = one collapsed line for stderr; full = multi-line chunk body for the bench file. */
+function citationDumpLines(c: ApiCitation, mode: 'full' | 'preview'): string[] {
+  const head = `  [${c.score.toFixed(3)}] ${c.guide_title} (chunk ${c.chunk_index}, id ${c.chunk_id})`;
+  if (mode === 'preview') {
+    const preview = (c.excerpt || c.content || '').replace(/\s+/g, ' ').slice(0, 300);
+    return [head, `    ${preview}`];
+  }
+  const raw = (c.content?.trim() ? c.content : c.excerpt || '').trimEnd();
+  if (!raw) return [head, '    (empty chunk)'];
+  return [head, '    --- chunk ---', ...raw.split('\n').map((line) => `    ${line}`)];
+}
+
+interface ApiGuide {
+  id: string;
+  game_id?: string | null;
+}
+
+interface ApiGame {
+  id: string;
+  title: string;
+}
+
+const guideGameIdCache = new Map<string, string | null>();
+const gameTitleCache = new Map<string, string | null>();
+
+async function fetchGuideGameId(guideId: string): Promise<string | null> {
+  if (guideGameIdCache.has(guideId)) return guideGameIdCache.get(guideId) ?? null;
+  const res = await fetch(`${BASE_URL}/api/guides/${encodeURIComponent(guideId)}`);
+  if (!res.ok) {
+    guideGameIdCache.set(guideId, null);
+    return null;
+  }
+  const body = (await res.json()) as { data?: ApiGuide };
+  const gameId = body.data?.game_id ?? null;
+  guideGameIdCache.set(guideId, gameId);
+  return gameId;
+}
+
+async function fetchGameTitle(gameId: string): Promise<string | null> {
+  if (gameTitleCache.has(gameId)) return gameTitleCache.get(gameId) ?? null;
+  const res = await fetch(`${BASE_URL}/api/games/${encodeURIComponent(gameId)}`);
+  if (!res.ok) {
+    gameTitleCache.set(gameId, null);
+    return null;
+  }
+  const body = (await res.json()) as { data?: ApiGame };
+  const title = body.data?.title ?? null;
+  gameTitleCache.set(gameId, title);
+  return title;
 }
 
 // Abort-aware sleep: resolves on either timeout or signal abort. Without this,
@@ -485,6 +611,27 @@ function checkRecall(citations: ApiCitation[], q: BenchQuestion): { hit: boolean
   return { hit: false, matchedTitle: null };
 }
 
+function checkGameCorrectTop1(citations: ApiCitation[], q: BenchQuestion): boolean | null {
+  if (q.kind !== 'specific') return null;
+  if (!q.expectedTitleRegex) return null;
+  const top = citations[0]?.guide_title ?? '';
+  if (!top) return false;
+  return q.expectedTitleRegex.test(top);
+}
+
+async function checkHardGameMatch(citations: ApiCitation[], q: BenchQuestion): Promise<boolean | null> {
+  if (q.kind !== 'specific') return null;
+  if (!q.expectedTitleRegex) return null;
+  for (const c of citations) {
+    const gameId = await fetchGuideGameId(c.guide_id);
+    if (!gameId) continue;
+    const title = await fetchGameTitle(gameId);
+    if (!title) continue;
+    if (q.expectedTitleRegex.test(title)) return true;
+  }
+  return false;
+}
+
 function checkAnswerKeywords(answer: string, expected: string[] | undefined): number {
   if (!expected || expected.length === 0) return 0;
   const lower = answer.toLowerCase();
@@ -537,6 +684,15 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
       throw new Error(`server not reachable at ${BASE_URL}: ${e.message}`);
     });
     if (!res.ok) throw new Error(`/api/health returned ${res.status}; aborting bench`);
+    if (OUTPUT_FILE_PATH) {
+      outputLines.length = 0;
+      outputLines.push(
+        `# RAG benchmark ${new Date().toISOString()}`,
+        `# BASE_URL=${BASE_URL}`,
+        ''
+      );
+      flushBenchQADump();
+    }
   });
 
   it.each(QUESTIONS)(
@@ -547,8 +703,42 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
       }
       const ans = await ask(q.question);
       const recall = checkRecall(ans.citations, q);
+      const gameCorrectTop1 = checkGameCorrectTop1(ans.citations, q);
+      const hardGameMatch = await checkHardGameMatch(ans.citations, q);
       const keywordHits = checkAnswerKeywords(ans.answer, q.expectedAnswerKeywords);
-      const passed = computePassed(q, ans, recall.hit, keywordHits);
+      const expectedKeywordCount = q.expectedAnswerKeywords?.length ?? 0;
+      const passed = computePassed(q, ans, recall.hit, keywordHits, expectedKeywordCount);
+
+      if (PRINT_ANSWERS || OUTPUT_FILE_PATH) {
+        const unexpectedHits = countUnexpectedKeywords(ans.answer, q.unexpectedAnswerKeywords);
+        const preamble = [
+          '\n========== ANSWER DUMP ==========',
+          `Q [${q.kind}]: ${q.question}`,
+          `no_answer: ${ans.no_answer}`,
+          `recall hit: ${recall.hit}${recall.matchedTitle ? ` → "${recall.matchedTitle}"` : ''}`,
+          `keyword hits: ${keywordHits}/${q.expectedAnswerKeywords?.length ?? 0}` +
+            (q.expectedAnswerKeywords?.length ? ` ${JSON.stringify(q.expectedAnswerKeywords)}` : ''),
+          ...(q.unexpectedAnswerKeywords?.length
+            ? [`unexpected keyword hits: ${unexpectedHits}/${q.unexpectedAnswerKeywords.length} ${JSON.stringify(q.unexpectedAnswerKeywords)}`]
+            : []),
+          `--- answer ---`,
+          ans.answer,
+          `--- citations (${ans.citations.length}) ---`,
+        ];
+        const previewCitationLines = ans.citations.flatMap((c) => citationDumpLines(c, 'preview'));
+        const fullCitationLines = ans.citations.flatMap((c) => citationDumpLines(c, 'full'));
+        const footer = '=================================\n';
+
+        if (PRINT_ANSWERS) {
+          /* eslint-disable no-console */
+          for (const l of [...preamble, ...previewCitationLines, footer]) console.warn(l);
+          /* eslint-enable no-console */
+        }
+        if (OUTPUT_FILE_PATH) {
+          outputLines.push(...preamble, ...fullCitationLines, footer);
+          flushBenchQADump();
+        }
+      }
 
       const result: BenchResult = {
         question: q.question,
@@ -557,8 +747,10 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
         recallHit: recall.hit,
         matchedTitle: recall.matchedTitle,
         answerKeywordHits: keywordHits,
-        expectedKeywordCount: q.expectedAnswerKeywords?.length ?? 0,
+        expectedKeywordCount,
         noAnswer: ans.no_answer,
+        gameCorrectTop1,
+        hardGameMatch,
         topTitles: ans.citations.slice(0, 3).map((c) => c.guide_title),
         totalMs: ans.timing_ms.total,
         embedMs: ans.timing_ms.embed,
@@ -588,9 +780,16 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
         `\nAnswer (truncated): ${ans.answer.slice(0, 200)}` +
         `\nExpected keywords: ${JSON.stringify(q.expectedAnswerKeywords ?? [])}` +
         `\nKeyword hits: ${keywordHits}` +
+        `\nHard-game match: ${result.hardGameMatch}` +
         (baselineExpect ? `\nBaseline: previously PASSED (regression).` : `\nBaseline: question is new (no prior state).`);
 
       expect(passed, `${describeExpectation(q)}${ctx}`).toBe(true);
+      if (REQUIRE_HARD_GAME_MATCH && q.kind === 'specific' && q.expectedTitleRegex) {
+        expect(
+          result.hardGameMatch,
+          `Expected hard game-id/title match for specific query.\nQuestion: ${q.question}\nTop titles: ${JSON.stringify(result.topTitles)}`
+        ).toBe(true);
+      }
     },
     TEST_TIMEOUT_MS
   );
@@ -604,14 +803,38 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
     }
 
     const byKind = (k: QuestionKind) => results.filter((r) => r.kind === k);
+    const specifics = byKind('specific');
     const recallable = [...byKind('specific'), ...byKind('ambiguous')];
     const recallHits = recallable.filter((r) => r.recallHit).length;
     const recallRate = recallable.length > 0 ? recallHits / recallable.length : 0;
     const [lo, hi] = wilson95(recallHits, recallable.length);
+    // Synth-side metrics decoupled from retrieval recall: answered = synth
+    // didn't refuse; keywordOk = answered AND hit ≥1 expected keyword (or had
+    // none expected); fullPasses = the new pass criterion (recall + answered +
+    // keyword). Recall alone hid that ~58% of recall hits were "I don't have
+    // that information" refusals.
+    const synthAnswered = recallable.filter((r) => !r.noAnswer).length;
+    const keywordOk = recallable.filter(
+      (r) => !r.noAnswer && (r.expectedKeywordCount === 0 || r.answerKeywordHits >= 1)
+    ).length;
+    const fullPasses = recallable.filter((r) => r.passed).length;
+    const specificHitRate = specifics.length > 0
+      ? specifics.filter((r) => r.recallHit).length / specifics.length
+      : 0;
+    const specificTop1GameCorrect = specifics.filter((r) => r.gameCorrectTop1 === true).length;
+    const specificHardGameMatch = specifics.filter((r) => r.hardGameMatch === true).length;
 
     const tricks = byKind('trick');
     const trickPasses = tricks.filter((r) => r.noAnswer || r.answerKeywordHits >= 1).length;
     const unanswerables = byKind('unanswerable');
+    const shouldAbstain = [...tricks, ...unanswerables];
+    const abstained = results.filter((r) => r.noAnswer);
+    const correctAbstains = shouldAbstain.filter((r) => r.noAnswer);
+    const abstainRecall = shouldAbstain.length > 0 ? correctAbstains.length / shouldAbstain.length : 0;
+    const abstainPrecision = abstained.length > 0
+      ? correctAbstains.length / abstained.length
+      : 0;
+
     const unanswerablePasses = unanswerables.filter((r) => r.noAnswer).length;
 
     const noAnswers = results.filter((r) => r.noAnswer).length;
@@ -625,21 +848,34 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
       `recall@${TOP_K} (specific+ambiguous): ${recallHits}/${recallable.length} = ${(recallRate * 100).toFixed(1)}% ` +
         `(95% CI: ${(lo * 100).toFixed(1)}–${(hi * 100).toFixed(1)}%)`
     );
+    console.warn(`synth answered (not refused): ${synthAnswered}/${recallable.length} = ${((synthAnswered / Math.max(1, recallable.length)) * 100).toFixed(1)}%`);
+    console.warn(`answered + ≥1 keyword hit:    ${keywordOk}/${recallable.length} = ${((keywordOk / Math.max(1, recallable.length)) * 100).toFixed(1)}%`);
+    console.warn(`fully passed (recall+synth+kw): ${fullPasses}/${recallable.length} = ${((fullPasses / Math.max(1, recallable.length)) * 100).toFixed(1)}%`);
+    console.warn(`specific recall hit rate:       ${(specificHitRate * 100).toFixed(1)}% (${specifics.filter((r) => r.recallHit).length}/${specifics.length})`);
+    console.warn(`specific top-1 game-correct:   ${specificTop1GameCorrect}/${specifics.length}`);
+    console.warn(`specific hard-game match:      ${specificHardGameMatch}/${specifics.length}`);
     console.warn(`trick correctly handled:   ${trickPasses}/${tricks.length}`);
     console.warn(`unanswerable handled:      ${unanswerablePasses}/${unanswerables.length}`);
+    console.warn(`abstain recall (trick+unans): ${(abstainRecall * 100).toFixed(1)}% (${correctAbstains.length}/${shouldAbstain.length})`);
+    console.warn(`abstain precision:          ${(abstainPrecision * 100).toFixed(1)}%`);
     console.warn(`no_answer responses (any): ${noAnswers}/${total}`);
     console.warn(`avg total: ${avgTotal.toFixed(0)}ms (retrieve ${avgRetrieve.toFixed(0)}ms, synth ${avgSynth.toFixed(0)}ms)`);
     console.warn('-------------------------------------------');
     for (const r of results) {
-      let status: string;
-      if (r.kind === 'unanswerable') status = r.noAnswer ? 'PASS' : 'FAIL';
-      else if (r.kind === 'trick') status = r.noAnswer || r.answerKeywordHits >= 1 ? 'PASS' : 'FAIL';
-      else status = r.recallHit ? 'HIT ' : 'MISS';
+      const status = r.passed ? 'PASS' : 'FAIL';
       const title = r.matchedTitle
         ? `→ "${r.matchedTitle.slice(0, 50)}"`
         : `(top: "${r.topTitles[0]?.slice(0, 50) ?? ''}")`;
       const kw = r.expectedKeywordCount > 0 ? ` kw=${r.answerKeywordHits}/${r.expectedKeywordCount}` : '';
-      console.warn(`  ${status}  [${r.kind.padEnd(12)}] ${r.question.slice(0, 60).padEnd(60)} ${title}${kw}`);
+      // Show the failure reason for recallable kinds so a 'FAIL' is actionable
+      // at a glance (refused / kw0 / miss) without needing the dump.
+      let why = '';
+      if ((r.kind === 'specific' || r.kind === 'ambiguous') && !r.passed) {
+        if (!r.recallHit) why = ' (no recall)';
+        else if (r.noAnswer) why = ' (refused)';
+        else if (r.expectedKeywordCount > 0 && r.answerKeywordHits === 0) why = ' (no kw)';
+      }
+      console.warn(`  ${status}  [${r.kind.padEnd(12)}] ${r.question.slice(0, 60).padEnd(60)} ${title}${kw}${why}`);
     }
     console.warn('===========================================\n');
     /* eslint-enable no-console */
@@ -759,5 +995,12 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
       `Aggregate recall ${(recallRate * 100).toFixed(1)}% < floor ${(RECALL_FLOOR * 100).toFixed(0)}% ` +
         `(${recallHits}/${recallable.length}). Tune RAG_BENCH_RECALL_FLOOR if intentional.`
     ).toBeGreaterThanOrEqual(RECALL_FLOOR);
+
+    // Final flush (same content as last per-question flush; ensures file closed).
+    if (OUTPUT_FILE_PATH && outputLines.length > 0) {
+      flushBenchQADump();
+      // eslint-disable-next-line no-console
+      console.warn(`[bench] Q&A dump written to ${OUTPUT_FILE_PATH} (${outputLines.length} lines)`);
+    }
   });
 });

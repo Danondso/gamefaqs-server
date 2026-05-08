@@ -10,8 +10,7 @@ import { config } from '../config';
 import DefaultDatabase from '../database/database';
 import type { IDatabase } from '../interfaces/IDatabase';
 import type { Guide } from '../types';
-import { AnnIndex } from './AnnIndex';
-import { chunkGuide } from './Chunker';
+import { chunkGuide, type Chunk } from './Chunker';
 import { EmbeddingService } from './EmbeddingService';
 
 export interface IndexProgress {
@@ -143,8 +142,13 @@ export class IndexingService {
 
   private async loop(opts: StartOpts): Promise<void> {
     const insertChunkStmt = this.db.getDb().prepare(
-      `INSERT INTO chunks (id, guide_id, chunk_index, content, char_start, char_end, token_count, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO chunks (
+          id, guide_id, chunk_index, content,
+          gamefaqs_id, franchise, language, guide_author, guide_type, review_status,
+          char_start, char_end, token_count, created_at,
+          content_type, section_heading, scenario
+        )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const deleteChunksStmt = this.db.getDb().prepare('DELETE FROM chunks WHERE guide_id = ?');
     const updateIndexedAtStmt = this.db.getDb().prepare('UPDATE guides SET indexed_at = ? WHERE id = ?');
@@ -169,7 +173,7 @@ export class IndexingService {
     let forceCursor = 0;
     type Loaded = {
       guide: Guide;
-      chunks: ReturnType<typeof chunkGuide>;
+      chunks: Chunk[];
       // Game-context prefix prepended to every chunk before FTS / embedding.
       // Empty string when no game is linked. Captured per-guide so the
       // join cost is paid once, not per-chunk.
@@ -222,6 +226,30 @@ export class IndexingService {
     const composeIndexedContent = (gamePrefix: string, body: string): string =>
       gamePrefix ? `${gamePrefix}\n\n${body}` : body;
 
+    const extractChunkMetadata = (guide: Guide): {
+      gamefaqsId: string;
+      franchise: string | null;
+      language: string | null;
+      guideAuthor: string | null;
+      guideType: string | null;
+      reviewStatus: string | null;
+    } => {
+      let meta: Record<string, any> = {};
+      try {
+        meta = guide.metadata ? JSON.parse(guide.metadata) : {};
+      } catch {
+        meta = {};
+      }
+      return {
+        gamefaqsId: String(meta.gamefaqs_id ?? meta.external_id ?? guide.id),
+        franchise: meta.franchise ?? null,
+        language: meta.language ?? meta.lang ?? null,
+        guideAuthor: meta.author ?? null,
+        guideType: meta.guide_type ?? meta.type ?? null,
+        reviewStatus: meta.review_status ?? meta.status ?? null,
+      };
+    };
+
     const writeGuide = (loaded: Loaded, vectors: Float32Array[]): void => {
       const { guide, chunks, gamePrefix } = loaded;
       // ANN updates run *outside* the SQL transaction. The ANN file isn't
@@ -247,6 +275,7 @@ export class IndexingService {
         }
 
         const now = Date.now();
+        const chunkMeta = extractChunkMetadata(guide);
         for (let i = 0; i < chunks.length; i++) {
           const c = chunks[i];
           const chunkId = nanoid();
@@ -255,7 +284,15 @@ export class IndexingService {
           // users will include the "Game: X" line at the top — that doubles
           // as helpful citation context.
           const indexedContent = composeIndexedContent(gamePrefix, c.content);
-          const r = insertChunkStmt.run(chunkId, guide.id, c.index, indexedContent, c.charStart, c.charEnd, c.tokenCount, now);
+          // v1 chunks leave content_type undefined → default to 'prose' (matches
+          // the v11 column default and keeps legacy rows at neutral baseline).
+          // section_heading is null when the chunker didn't attach one.
+          const r = insertChunkStmt.run(
+            chunkId, guide.id, c.index, indexedContent,
+            chunkMeta.gamefaqsId, chunkMeta.franchise, chunkMeta.language, chunkMeta.guideAuthor, chunkMeta.guideType, chunkMeta.reviewStatus,
+            c.charStart, c.charEnd, c.tokenCount, now,
+            c.content_type ?? 'prose', c.section_heading ?? null, c.scenario ?? null
+          );
           insertedRowids.push(Number(r.lastInsertRowid));
         }
         updateIndexedAtStmt.run(now, guide.id);

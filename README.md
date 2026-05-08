@@ -72,8 +72,7 @@ ADMIN_TOKEN=                  # Token to protect admin panel (empty = open acces
 # Ollama AI Integration (optional)
 OLLAMA_HOST=http://localhost:11434
 OLLAMA_MODEL=qwen3:latest        # Default model for general AI features
-SYNTHESIS_MODEL=qwen3:1.7b       # Model that synthesizes /api/guides/answer responses
-                                 # (smaller = faster; trades some refusal discipline on edge cases)
+SYNTHESIS_MODEL=qwen3:30b-a3b-instruct-2507-q4_K_M   # /api/guides/answer synthesis (Qwen3 MoE instruct, Q4_K_M)
 
 # MCP Server (optional)
 GAMEFAQS_API_URL=             # If set, MCP server proxies to this REST API instead of opening the local DB
@@ -184,10 +183,10 @@ docker run -d -p 11434:11434 --name ollama ollama/ollama
 
 # Pull the default models
 docker exec ollama ollama pull qwen3:latest    # OLLAMA_MODEL — metadata / general use
-docker exec ollama ollama pull qwen3:1.7b      # SYNTHESIS_MODEL — answer synthesis
+docker exec ollama ollama pull qwen3:30b-a3b-instruct-2507-q4_K_M   # SYNTHESIS_MODEL — answer synthesis
 ```
 
-The synthesis model defaults to `qwen3:1.7b` because it lands ~40% faster synth latency at the same retrieval recall as larger variants. It's slightly more eager to answer when it shouldn't (trick / unanswerable questions get worse refusal discipline) — acceptable for a guide-archive Q&A tool where real questions name the game and want a direct answer. Bump to `qwen3:8b` via `SYNTHESIS_MODEL` if refusal discipline matters more than latency.
+The synthesis default in `docker-compose.yml` and `src/config.ts` is `qwen3:30b-a3b-instruct-2507-q4_K_M`. Override via `SYNTHESIS_MODEL`. Synthesis always runs at `temperature: 0, seed: 42` for deterministic output.
 
 ## Admin Panel Security
 

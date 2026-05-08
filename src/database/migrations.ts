@@ -1,10 +1,17 @@
 import Database from 'better-sqlite3';
-import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH, FILTER_LOOKUP_TRIGGERS, RAG_DDL, GAMES_FTS_DDL, SCHEMA_VERSION } from './schema';
+import { CREATE_TABLES, CREATE_INDEXES, FULL_TEXT_SEARCH, FILTER_LOOKUP_TRIGGERS, RAG_DDL, GAMES_FTS_DDL, TITLE_FTS_V6, SCHEMA_VERSION } from './schema';
 
 export interface Migration {
   version: number;
   up: (db: Database.Database) => void;
   down?: (db: Database.Database) => void;
+}
+
+/** Fresh DBs load current CREATE_TABLES before migrations; older migrations that ALTER ADD must skip existing columns. */
+function addColumnIfMissing(db: Database.Database, table: string, column: string, typeSql: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (cols.some((c) => c.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeSql}`);
 }
 
 // Title-relabel CASE for migration v5. Evaluated against `g` (guides row) and
@@ -256,8 +263,219 @@ const migration_v5: Migration = {
   },
 };
 
+// Migration v6: collapsed end-state of what was previously v6..v11 plus the
+// chunks.scenario tag (a never-released v7 on this branch). Idempotent so
+// existing DBs at v11 can be re-stamped (`DELETE FROM schema_version WHERE
+// version > 5`) and walked forward without losing the corpus or ANN file.
+//
+// What this rolls in:
+//   - v6 — rebuild guides_fts_meta to read titles from `games.title` (drops
+//     author leakage from the v5 title relabel)
+//   - v7 — chunks provenance columns + backfill
+//   - v8 — extraction tables (canonical_game_groups, game_aliases,
+//     game_entities), games.canonical_group_id column, indexes. SEEDING
+//     moved to EntitySeedService (runs post-import so games is populated).
+//   - v9 / v10 — entity-table seeding and confidence recomputation. Both
+//     moved to EntitySeedService; v9's `\bvii\b` regex bug is fixed at the
+//     source there, so v10's cleanup pass is no longer needed.
+//   - v11 — chunks.content_type / section_heading columns
+//   - chunks.scenario — comma-joined gated-content tags (ng_plus / secret /
+//     missable) used by RetrievalService for the soft 0.7× penalty on plain
+//     questions. Backfill is content-only (no chunker re-run, no re-embed);
+//     new chunks set this at insert time via Chunker.detectScenario.
+//
+// Idempotency rules: every CREATE uses IF NOT EXISTS; every ADD COLUMN goes
+// through addColumnIfMissing; the FTS rebuild is a DELETE+INSERT gated on
+// `count == 0` for guides_fts_meta (so a re-stamped DB skips the rebuild —
+// it's already correct); the chunks-provenance backfill is gated on
+// `gamefaqs_id IS NULL`; the scenario backfill UPDATEs are gated per-tag on
+// `scenario IS NULL OR NOT LIKE '%tag%'` so re-runs no-op.
+const migration_v6: Migration = {
+  version: 6,
+  up: (db: Database.Database) => {
+    console.log('[Migrations] v6: applying collapsed schema (was v6-v11)...');
+
+    // ── 1. Title-FTS triggers — read from games.title, not guides.title ──
+    db.exec('DROP TRIGGER IF EXISTS guides_fts_meta_insert');
+    db.exec('DROP TRIGGER IF EXISTS guides_fts_meta_update');
+    db.exec('DROP TRIGGER IF EXISTS games_title_propagate_to_guides_fts');
+    db.exec(TITLE_FTS_V6.guides_fts_meta_insert);
+    db.exec(TITLE_FTS_V6.guides_fts_meta_update);
+    db.exec(TITLE_FTS_V6.games_title_propagate);
+
+    // ── 2. Rebuild guides_fts_meta from JOIN (only if empty) ──
+    // On a re-stamped v11 DB this is already correct (count > 0) and we skip.
+    // On a fresh DB at this point guides is empty (import runs after
+    // migrations), so the INSERT no-ops anyway — but the `count == 0` guard
+    // makes intent explicit and avoids a wasted DELETE on big DBs.
+    const titleFtsCount = (db.prepare('SELECT COUNT(*) c FROM guides_fts_meta').get() as { c: number }).c;
+    if (titleFtsCount === 0) {
+      const rebuildTxn = db.transaction(() => {
+        db.exec(`DELETE FROM guides_fts_meta`);
+        db.exec(`
+          INSERT INTO guides_fts_meta(guide_id, title, tags)
+          SELECT
+            g.id,
+            COALESCE(gm.title, g.title),
+            COALESCE(json_extract(g.metadata, '$.tags'), '')
+          FROM guides g
+          LEFT JOIN games gm ON gm.id = g.game_id
+        `);
+      });
+      rebuildTxn();
+    }
+
+    // ── 3. Chunks provenance columns (was v7) ──
+    addColumnIfMissing(db, 'chunks', 'gamefaqs_id', 'TEXT');
+    addColumnIfMissing(db, 'chunks', 'franchise', 'TEXT');
+    addColumnIfMissing(db, 'chunks', 'language', 'TEXT');
+    addColumnIfMissing(db, 'chunks', 'guide_author', 'TEXT');
+    addColumnIfMissing(db, 'chunks', 'guide_type', 'TEXT');
+    addColumnIfMissing(db, 'chunks', 'review_status', 'TEXT');
+
+    // Backfill provenance, gated on a NULL gamefaqs_id sentinel. New chunks
+    // written by IndexingService set these at insert time, so this UPDATE
+    // only matters for pre-existing rows that predate the columns.
+    const needsBackfill = db.prepare(
+      `SELECT 1 FROM chunks WHERE gamefaqs_id IS NULL LIMIT 1`
+    ).get();
+    if (needsBackfill) {
+      db.exec(`
+        UPDATE chunks AS c
+        SET
+          gamefaqs_id = COALESCE(
+            json_extract(g.metadata, '$.gamefaqs_id'),
+            json_extract(g.metadata, '$.external_id'),
+            g.id
+          ),
+          franchise = COALESCE(
+            json_extract(g.metadata, '$.franchise'),
+            json_extract(gm.metadata, '$.franchise')
+          ),
+          language = COALESCE(
+            json_extract(g.metadata, '$.language'),
+            json_extract(g.metadata, '$.lang'),
+            json_extract(gm.metadata, '$.language')
+          ),
+          guide_author = json_extract(g.metadata, '$.author'),
+          guide_type = COALESCE(
+            json_extract(g.metadata, '$.guide_type'),
+            json_extract(g.metadata, '$.type')
+          ),
+          review_status = COALESCE(
+            json_extract(g.metadata, '$.review_status'),
+            json_extract(g.metadata, '$.status')
+          )
+        FROM guides g
+        LEFT JOIN games gm ON gm.id = g.game_id
+        WHERE c.guide_id = g.id
+          AND c.gamefaqs_id IS NULL
+      `);
+    }
+
+    // ── 4. Extraction tables + games.canonical_group_id (was v8 schema) ──
+    // Seeding (canonical groups, aliases, entities) is NOT done here — it
+    // moved to EntitySeedService so it can run post-import, when `games` is
+    // actually populated. v8's "seed at migration time" was the bug that
+    // left `game_aliases` / `game_entities` permanently empty on fresh
+    // installs.
+    db.exec(CREATE_TABLES.canonical_game_groups);
+    addColumnIfMissing(db, 'games', 'canonical_group_id', 'TEXT');
+    db.exec(CREATE_INDEXES.games_canonical_group_id);
+
+    db.exec(CREATE_TABLES.game_aliases);
+    db.exec(CREATE_INDEXES.game_aliases_game_id);
+    db.exec(CREATE_TABLES.game_entities);
+    db.exec(CREATE_INDEXES.game_entities_entity);
+    db.exec(CREATE_INDEXES.game_entities_game_id);
+
+    // ── 5. Chunker chunk-type columns (was v11) ──
+    addColumnIfMissing(db, 'chunks', 'content_type', "TEXT NOT NULL DEFAULT 'prose'");
+    addColumnIfMissing(db, 'chunks', 'section_heading', 'TEXT');
+
+    // ── 6. chunks.scenario tag + content-only backfill ──
+    // Gated-content tags drive the soft 0.7× retrieval penalty applied when a
+    // question carries no scenario cue (see SCENARIO_CUE_RE in RetrievalService).
+    // Multiple tags can apply to one chunk; we comma-join in deterministic order.
+    addColumnIfMissing(db, 'chunks', 'scenario', 'TEXT');
+    const scenarioTxn = db.transaction(() => {
+      // ng_plus: New Game+ / NG+ / second playthrough markers.
+      db.exec(`
+        UPDATE chunks SET scenario = 'ng_plus'
+        WHERE scenario IS NULL
+          AND (
+            content LIKE '%new game+%' COLLATE NOCASE
+            OR content LIKE '%new game +%' COLLATE NOCASE
+            OR content LIKE '%NG+%'
+            OR content LIKE '%second playthrough%' COLLATE NOCASE
+          )
+      `);
+      // secret: secret/hidden/easter-egg content. Word-boundary check via
+      // multi-token search to avoid matching innocuous "hidden" usage in
+      // mechanics text. False positives are tolerable — the retrieval-side
+      // penalty is soft (0.7×) and only fires on plain questions.
+      db.exec(`
+        UPDATE chunks SET scenario = COALESCE(scenario || ',', '') || 'secret'
+        WHERE (scenario IS NULL OR scenario NOT LIKE '%secret%')
+          AND (
+            content LIKE '%easter egg%' COLLATE NOCASE
+            OR content LIKE '%secret boss%' COLLATE NOCASE
+            OR content LIKE '%secret ending%' COLLATE NOCASE
+            OR content LIKE '%secret level%' COLLATE NOCASE
+            OR content LIKE '%hidden boss%' COLLATE NOCASE
+            OR content LIKE '%hidden level%' COLLATE NOCASE
+          )
+      `);
+      // missable: explicit missable / point-of-no-return markers.
+      db.exec(`
+        UPDATE chunks SET scenario = COALESCE(scenario || ',', '') || 'missable'
+        WHERE (scenario IS NULL OR scenario NOT LIKE '%missable%')
+          AND (
+            content LIKE '%missable%' COLLATE NOCASE
+            OR content LIKE '%point of no return%' COLLATE NOCASE
+          )
+      `);
+    });
+    scenarioTxn();
+    const scenarioTagged = (db.prepare(
+      `SELECT COUNT(*) c FROM chunks WHERE scenario IS NOT NULL`
+    ).get() as { c: number }).c;
+
+    db.exec(`INSERT INTO schema_version (version, applied_at) VALUES (6, ${Date.now()})`);
+    console.log(`[Migrations] v6 applied (${scenarioTagged} chunks tagged with scenario)`);
+  },
+  down: (db: Database.Database) => {
+    // Best-effort downgrade; mostly here to keep the migration interface
+    // consistent. Not exercised in production paths.
+    try {
+      db.exec('ALTER TABLE chunks DROP COLUMN scenario');
+    } catch {
+      // ignore — column absent or older SQLite
+    }
+    db.exec('DROP TRIGGER IF EXISTS games_title_propagate_to_guides_fts');
+    db.exec('DROP TRIGGER IF EXISTS guides_fts_meta_update');
+    db.exec('DROP TRIGGER IF EXISTS guides_fts_meta_insert');
+    db.exec(FULL_TEXT_SEARCH.guides_fts_meta_insert);
+    db.exec(FULL_TEXT_SEARCH.guides_fts_meta_update);
+    db.exec(`DELETE FROM guides_fts_meta`);
+    db.exec(`
+      INSERT INTO guides_fts_meta(guide_id, title, tags)
+      SELECT id, title, COALESCE(json_extract(metadata, '$.tags'), '')
+      FROM guides
+    `);
+    db.exec('DROP INDEX IF EXISTS idx_game_entities_game_id');
+    db.exec('DROP INDEX IF EXISTS idx_game_entities_entity');
+    db.exec('DROP INDEX IF EXISTS idx_game_aliases_game_id');
+    db.exec('DROP TABLE IF EXISTS game_entities');
+    db.exec('DROP TABLE IF EXISTS game_aliases');
+    db.exec('DROP INDEX IF EXISTS idx_games_canonical_group_id');
+    db.exec('DROP TABLE IF EXISTS canonical_game_groups');
+    db.exec('DELETE FROM schema_version WHERE version = 6');
+  },
+};
+
 // All migrations in order
-export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5];
+export const migrations: Migration[] = [migration_v1, migration_v2, migration_v3, migration_v4, migration_v5, migration_v6];
 
 // Get current schema version from database
 export function getCurrentVersion(db: Database.Database): number {
