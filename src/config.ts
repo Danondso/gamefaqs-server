@@ -1,5 +1,3 @@
-import * as path from 'path';
-
 export const config = {
   // Server settings
   port: parseInt(process.env.PORT || '3000', 10),
@@ -46,13 +44,6 @@ export const config = {
   // content stays under 2048 after chunking + overlap.
   chunkSizeTokens: parseInt(process.env.CHUNK_SIZE_TOKENS || '400', 10),
   chunkOverlapTokens: parseInt(process.env.CHUNK_OVERLAP_TOKENS || '50', 10),
-  // Chunker dispatch: 'v1' (legacy greedy paragraph packer) | 'v2' (type-aware,
-  // emits content_type/section_heading per chunk). v1 is the default until
-  // Phase 5's bench shows v2 improvement on the live corpus; flip via
-  // CHUNKER_VERSION=v2 to opt newly-indexed guides into v2 without re-indexing
-  // already-indexed ones (mixed populations are fine — schema v11 defaults
-  // legacy rows to content_type='prose'). See CHUNKER_DESIGN.md.
-  chunkerVersion: (process.env.CHUNKER_VERSION === 'v2' ? 'v2' : 'v1') as 'v1' | 'v2',
   // ANN (USearch HNSW i8). Default file lives next to the SQLite db so a
   // single mount covers both. Knobs match the bake-off run that picked
   // USearch i8 (recall@8 87% end-to-end vs the brute-force baseline,
@@ -78,8 +69,3 @@ export const config = {
   // CORS: in production, set CORS_ORIGIN to restrict (e.g. "https://app.example.com" or comma-separated list)
   corsOrigin: process.env.CORS_ORIGIN,
 };
-
-// Ensure directories are absolute paths for Docker volumes
-export function ensureAbsolutePath(p: string): string {
-  return path.isAbsolute(p) ? p : path.resolve(process.cwd(), p);
-}

@@ -3,6 +3,7 @@ import swaggerUi from 'swagger-ui-express';
 import { config } from './config';
 import Database from './database/database';
 import InitService from './services/InitService';
+import { needsSeed, seedAll } from './services/EntitySeedService';
 import { EmbeddingService } from './services/EmbeddingService';
 import { SynthesisService } from './services/SynthesisService';
 import { RetrievalService } from './services/RetrievalService';
@@ -172,6 +173,20 @@ async function main() {
     console.log(`[Server] API: http://${config.host}:${config.port}/api`);
     console.log(`[Server] ApiDocs routes: GET /api-docs/spec.json, GET /api-docs/, use /api-docs (serve), GET /api-docs (setup)`);
   });
+
+  // Boot safety-net for the entity seed tables. Catches DBs that were
+  // imported under an older code version (or migration-collapsed via the
+  // documented `DELETE FROM schema_version WHERE version > 5;` re-stamp)
+  // and never had the post-import seeding run. Cheap to check (two COUNT
+  // queries); seeds in-place if needed without re-importing the corpus.
+  try {
+    if (needsSeed(Database.getDb())) {
+      console.log('[Server] Detected populated games but empty game_aliases — running seed...');
+      seedAll(Database.getDb());
+    }
+  } catch (err) {
+    console.warn('[Server] Boot-time entity seed check failed (continuing):', err);
+  }
 
   // Start initialization in background
   console.log('[Server] Starting initialization check...');

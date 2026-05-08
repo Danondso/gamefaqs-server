@@ -1,7 +1,7 @@
 // SQLite database schema definitions
 // Ported from gamefaqs-reader mobile app
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 6;
 
 export const CREATE_TABLES = {
   guides: `
@@ -130,6 +130,7 @@ export const CREATE_TABLES = {
       created_at      INTEGER NOT NULL,
       content_type    TEXT NOT NULL DEFAULT 'prose',
       section_heading TEXT,
+      scenario        TEXT,
       FOREIGN KEY (guide_id) REFERENCES guides(id) ON DELETE CASCADE,
       UNIQUE(guide_id, chunk_index)
     );

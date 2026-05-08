@@ -1,5 +1,11 @@
 # Chunker investigation report
 
+> **Archival.** This documents the failure modes of the legacy greedy
+> paragraph-packing chunker that motivated the current type-aware chunker.
+> The legacy implementation has been removed; see CHUNKER_DESIGN.md for the
+> live design. Kept for historical context — references to "Phase 2/3/5" and
+> the v1/v2 split below are pre-cutover language.
+
 **Phase 1 of the chunker rework.** This report inventories how the current
 chunker produces chunks, what content-type patterns appear in the GameFAQs
 corpus, and which patterns drive the bench failures we want the rework to

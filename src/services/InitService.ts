@@ -5,6 +5,8 @@ import GameModel from '../models/Game';
 import ArchiveDownloadService from './ArchiveDownloadService';
 import ArchiveExtractor from './ArchiveExtractor';
 import GuideImporter from './GuideImporter';
+import Database from '../database/database';
+import { seedAll } from './EntitySeedService';
 import { config } from '../config';
 import type { InitStatus, InitStatusCallback } from '../types';
 
@@ -157,6 +159,15 @@ class InitService {
 
       const finalGuideCount = GuideModel.getTotalCount();
       const finalGameCount = GameModel.getTotalCount();
+
+      // Seed canonical groups, aliases, and entities now that `games` is
+      // populated. This used to live in migrations v8-v10, but migrations
+      // run before the archive import so they always seeded zero rows.
+      try {
+        seedAll(Database.getDb());
+      } catch (err) {
+        console.warn('[Init] EntitySeedService failed (continuing — extraction will be reduced):', err);
+      }
 
       const elapsedMinutes = this.status.startTime
         ? Math.floor((Date.now() - this.status.startTime) / 1000 / 60)

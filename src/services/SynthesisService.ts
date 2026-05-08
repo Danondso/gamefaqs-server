@@ -40,6 +40,10 @@ const PROMPT_HEADER =
 15. If a claim's only support in the excerpts is a numeric label or structural identifier (encounter ID, formation ID, section number, AI script name), it is not grounded evidence — do not state it as a fact. If no usable mechanic or narrative (not just tables/IDs) exists in the excerpts for a strategy question, reply with the no-answer sentence.
 16. For boss-strategy questions: do not invent spells, items, steal routes, or damage values—only use plain prose that appears in the excerpts. Stat/ID tables alone are not a strategy. If there is no such prose (or only a few sentences about scripted outcomes), summarize just those sentences or use the no-answer sentence—never pad with tactics not written in the excerpts.
 17. Any paragraph or bullet that contains numerals (levels, item counts, puzzle rotations) must include at least one valid [n] source marker in that same paragraph—answers with bare numbers and no bracketed cite are rejected.
+18. Cite ONE source per claim—the most directly supporting excerpt. Only stack [a,b] when the claim genuinely needs two sources together (e.g. one provides a number, the other provides the context). Do not chain redundant cites.
+19. When several sentences in a row come from the same source, write a single [n] at the end of that paragraph or claim block. Do not repeat the same [n] on every sentence.
+20. If excerpts describe DIFFERENT strategies for the same problem, pick ONE coherent strategy as the main answer. Prefer the strategy with the most complete coverage in a single excerpt; tiebreak on excerpt order (earlier = higher relevance). List any alternatives in a separate "Alternative approaches:" section at the END—never interleave mutually-exclusive starting actions in the main numbered steps. Steps must be executable in order as written.
+21. If excerpts describe scenarios with DIFFERENT prerequisites (New Game+ only, secret/optional, missable, version-specific, hardcore-only), either (a) pick the canonical / most likely intended scenario based on the question and stick to it, or (b) explicitly section the answer ("Standard fight" vs "New Game+ secret fight"). Do NOT mix NG+ stat thresholds, secret-only items, or version-locked content into the canonical answer for a plain question. Treat scenario cues in the question (words like "secret", "early", "NG+", "missable") as the signal that the user wants the gated scenario.
 
 Excerpts:
 `;
@@ -114,6 +118,7 @@ export class SynthesisService {
     // no-answer sentence or useful reasoning the refusal service can detect.
     const raw = ((data.response ?? '').trim() || (data.thinking ?? '').trim());
     let cleaned = this.stripInvalidCitations(raw, citations.length);
+    cleaned = this.verifyCitations(cleaned, citations);
     cleaned = this.preventSelfContradiction(cleaned);
     const noAnswer = this.isNoAnswer(cleaned) || !this.hasGroundedClaims(cleaned, citations.length);
 
@@ -133,6 +138,59 @@ export class SynthesisService {
       if (valid.length === 0) return '';
       if (valid.length === nums.length) return full;
       return `[${valid.join(',')}]`;
+    });
+  }
+
+  // Post-synth verification: for each [N] (or [N,M]) in the answer, check that
+  // the cited chunk's text actually contains distinctive tokens from the
+  // surrounding claim. If it doesn't, re-route to the best-supporting chunk
+  // or strip the cite. Cheap: pure string ops, no LLM call.
+  //
+  // Distinctive tokens = integer literals, capitalized multi-letter words
+  // (≥4 chars), hyphenated compounds, quoted item names. Stopwords filtered.
+  private verifyCitations(text: string, citations: Citation[]): string {
+    if (citations.length === 0) return text;
+    const chunks = citations.map(c => (c.content || c.excerpt || '').toLowerCase());
+    return text.replace(/\[(\d+(?:\s*,\s*\d+)*)\]/g, (full, inner: string, offset: number) => {
+      const ids = inner.split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isInteger(n));
+      if (ids.length === 0) return full;
+      const claim = extractClaimWindow(text, offset);
+      const tokens = extractDistinctiveTokens(claim);
+      if (tokens.length === 0) return full; // nothing distinctive to verify against
+      const supports = (idx: number) => countSupport(chunks[idx - 1], tokens);
+      const newIds: number[] = [];
+      for (const id of ids) {
+        if (id < 1 || id > citations.length) continue;
+        const score = supports(id);
+        if (score >= 1) {
+          newIds.push(id);
+          continue;
+        }
+        // Try to re-route to the best other citation.
+        let bestIdx = -1;
+        let bestScore = 0;
+        for (let i = 1; i <= citations.length; i++) {
+          if (i === id) continue;
+          const s = supports(i);
+          if (s > bestScore) { bestScore = s; bestIdx = i; }
+        }
+        if (bestIdx > 0) {
+          if (!newIds.includes(bestIdx)) newIds.push(bestIdx);
+          console.warn('[Synthesis] citation verify:', JSON.stringify({
+            action: 'rerouted',
+            original_index: id,
+            new_index: bestIdx,
+            claim_preview: claim.slice(-80),
+          }));
+        } else {
+          console.warn('[Synthesis] citation verify:', JSON.stringify({
+            action: 'stripped',
+            original_index: id,
+            claim_preview: claim.slice(-80),
+          }));
+        }
+      }
+      return newIds.length === 0 ? '' : `[${newIds.join(',')}]`;
     });
   }
 
@@ -211,4 +269,59 @@ export class SynthesisService {
       clearTimeout(timer);
     }
   }
+}
+
+// Walk back from a [N] offset to the nearest sentence boundary so we can
+// score the citation against the claim it sits at the end of. Stops at
+// `.`/`?`/`!` followed by space, blank line, or list-marker boundary.
+function extractClaimWindow(text: string, citeOffset: number): string {
+  let start = citeOffset;
+  for (let i = citeOffset - 1; i >= 0; i--) {
+    const ch = text[i];
+    if (ch === '\n' && text[i - 1] === '\n') { start = i + 1; break; }
+    if ((ch === '.' || ch === '?' || ch === '!') && /\s/.test(text[i + 1] ?? '')) { start = i + 1; break; }
+    if (ch === '\n' && /^\s*(?:[-*+]|\d+[.)])\s/.test(text.slice(i + 1, i + 8))) { start = i + 1; break; }
+    start = i;
+  }
+  return text.slice(start, citeOffset);
+}
+
+// Pull tokens worth verifying. We aim for high-precision: integer literals,
+// capitalized multi-letter words (proper-noun heuristic), hyphenated compounds,
+// quoted item names. Stopword set kills the most common false positives that
+// otherwise survive the capitalization check at sentence starts.
+const VERIFY_STOPWORDS = new Set([
+  'these', 'those', 'there', 'their', 'they', 'them', 'then', 'this', 'that',
+  'after', 'before', 'once', 'when', 'while', 'where', 'which', 'with', 'will',
+  'first', 'second', 'third', 'next', 'finally', 'also', 'however', 'note',
+  'use', 'using', 'used', 'pick', 'take', 'get', 'go', 'goto',
+  'step', 'steps', 'this', 'rule', 'item', 'items', 'enemy', 'enemies',
+]);
+function extractDistinctiveTokens(claim: string): string[] {
+  const out = new Set<string>();
+  // Integer literals (1-4 digits keeps us from grabbing IDs and addresses).
+  for (const m of claim.matchAll(/\b\d{1,4}\b/g)) out.add(m[0].toLowerCase());
+  // Quoted names — single or double quotes, ASCII or smart.
+  for (const m of claim.matchAll(/[\"'“‘]([A-Za-z][\w\s'-]{1,40}?)[\"'”’]/g)) {
+    const t = m[1].toLowerCase().trim();
+    if (t.length >= 3 && !VERIFY_STOPWORDS.has(t)) out.add(t);
+  }
+  // Hyphenated compounds (e.g., "L+R", "Master-Sword", "TMP-ammo").
+  for (const m of claim.matchAll(/\b[A-Za-z][A-Za-z0-9]+(?:[-+][A-Za-z0-9]+)+\b/g)) {
+    out.add(m[0].toLowerCase());
+  }
+  // Capitalized multi-letter words ≥4 chars. Excludes sentence-starters via stopword set.
+  for (const m of claim.matchAll(/\b[A-Z][a-zA-Z]{3,}\b/g)) {
+    const t = m[0].toLowerCase();
+    if (!VERIFY_STOPWORDS.has(t)) out.add(t);
+  }
+  return Array.from(out);
+}
+
+function countSupport(chunkLower: string, tokens: string[]): number {
+  let n = 0;
+  for (const t of tokens) {
+    if (chunkLower.includes(t)) n++;
+  }
+  return n;
 }

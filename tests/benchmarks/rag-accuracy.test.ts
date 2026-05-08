@@ -110,6 +110,13 @@ interface BenchQuestion {
   // synthesized answer. Hard signal for `trick`: at least one keyword present
   // OR no_answer=true counts as "premise corrected."
   expectedAnswerKeywords?: string[];
+  /**
+   * Keywords whose presence in the answer counts as a regression. Used to
+   * catch scenario blending (e.g. NG+ stat thresholds in a plain Lavos
+   * answer) and other "the model dragged in content from the wrong scenario"
+   * failures. Any hit fails the question.
+   */
+  unexpectedAnswerKeywords?: string[];
   notes?: string;
 }
 
@@ -193,6 +200,16 @@ const QUESTIONS: BenchQuestion[] = [
     kind: 'specific',
     expectedTitleRegex: RX_CHRONO,
     expectedAnswerKeywords: ['Lavos'],
+    // The plain question must NOT drag in NG+-only content (Level 60+, Crono's
+    // Rainbow, Nova Armor, the Lucca pod / NG+ early-Lavos trick).
+    unexpectedAnswerKeywords: ['New Game+', 'NG+', 'Rainbow Sword', 'Nova Armor', 'Lucca\'s pod'],
+  },
+  {
+    question: 'How do I beat Lavos early in Chrono Trigger?',
+    kind: 'specific',
+    expectedTitleRegex: RX_CHRONO,
+    expectedAnswerKeywords: ['New Game', 'Lavos'],
+    notes: 'The "early Lavos" fight is NG+-only. The answer SHOULD reference NG+, the Lucca pod trick, or similar gating.',
   },
   {
     question: 'How do I beat Kefka in Final Fantasy VI?',
@@ -404,6 +421,8 @@ function computePassed(
   keywordHits: number,
   expectedKeywordCount: number
 ): boolean {
+  // Any unexpected-keyword hit is a regression, regardless of kind.
+  if (countUnexpectedKeywords(ans.answer, q.unexpectedAnswerKeywords) > 0) return false;
   const productiveRefusal = isProductiveRefusal(ans.answer);
   switch (q.kind) {
     case 'specific':
@@ -414,6 +433,22 @@ function computePassed(
     case 'trick':
       return ans.no_answer || productiveRefusal || keywordHits >= 1;
   }
+}
+
+// Scope the unexpected-keyword check to the *canonical* portion of the answer.
+// When Rule 20/21 fire correctly the synth sections gated content under an
+// "Alternative approaches" / "New Game+ secret fight" / similar header, which
+// is the desired outcome — those scoped mentions should NOT count as bleed.
+// Only banned keywords that appear before the first such header are flagged.
+const ALT_SECTION_RE = /(?:^|\n)\s*(?:[*_-]{0,2}\s*)(?:Alternative\s+approaches?|Alternatives?|New\s+Game\s*\+\s+(?:secret|fight|version)|Secret\s+(?:fight|version)|Optional\s+fight|Standard\s+fight)\s*[:\-]/i;
+function canonicalAnswerSegment(answer: string): string {
+  const m = ALT_SECTION_RE.exec(answer);
+  return m ? answer.slice(0, m.index) : answer;
+}
+function countUnexpectedKeywords(answer: string, banned: string[] | undefined): number {
+  if (!banned || banned.length === 0) return 0;
+  const lower = canonicalAnswerSegment(answer).toLowerCase();
+  return banned.reduce((n, k) => (lower.includes(k.toLowerCase()) ? n + 1 : n), 0);
 }
 
 function isProductiveRefusal(answer: string): boolean {
@@ -675,6 +710,7 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
       const passed = computePassed(q, ans, recall.hit, keywordHits, expectedKeywordCount);
 
       if (PRINT_ANSWERS || OUTPUT_FILE_PATH) {
+        const unexpectedHits = countUnexpectedKeywords(ans.answer, q.unexpectedAnswerKeywords);
         const preamble = [
           '\n========== ANSWER DUMP ==========',
           `Q [${q.kind}]: ${q.question}`,
@@ -682,6 +718,9 @@ describe.skipIf(!RUN)('RAG accuracy benchmark', () => {
           `recall hit: ${recall.hit}${recall.matchedTitle ? ` → "${recall.matchedTitle}"` : ''}`,
           `keyword hits: ${keywordHits}/${q.expectedAnswerKeywords?.length ?? 0}` +
             (q.expectedAnswerKeywords?.length ? ` ${JSON.stringify(q.expectedAnswerKeywords)}` : ''),
+          ...(q.unexpectedAnswerKeywords?.length
+            ? [`unexpected keyword hits: ${unexpectedHits}/${q.unexpectedAnswerKeywords.length} ${JSON.stringify(q.unexpectedAnswerKeywords)}`]
+            : []),
           `--- answer ---`,
           ans.answer,
           `--- citations (${ans.citations.length}) ---`,

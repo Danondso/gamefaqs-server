@@ -1,29 +1,14 @@
-// Paragraph-aware fixed-window chunker for guide content.
+// Type-aware paragraph-level chunker for guide content.
 //
-// Two implementations live here:
-//
-//   chunkGuide   (v1, legacy): pure greedy paragraph packer with an ASCII-art
-//                drop filter. No content-type awareness — every chunk is just
-//                "the next ~400-token slice of paragraphs". Drowns strategy
-//                prose under stat tables and packs TOCs/changelogs as content.
-//                See CHUNKER_INVESTIGATION.md for the failure modes.
-//
-//   chunkGuideV2 (new): per-line classification → paragraph-level classification
-//                → type-aware packing. Each emitted chunk carries one
-//                content_type ('prose' | 'reference' | 'mixed') and may carry
-//                a section_heading. Type shifts (prose ↔ reference) force a
-//                flush, so a stat block never shares a chunk with strategy
-//                prose. See CHUNKER_DESIGN.md for the heuristic design and
-//                threshold rationale.
+// Pipeline: per-line classification → paragraph-level classification →
+// type-aware packing. Each emitted chunk carries one content_type
+// ('prose' | 'reference' | 'mixed') and may carry a section_heading. Type
+// shifts (prose ↔ reference) force a flush, so a stat block never shares a
+// chunk with strategy prose. See CHUNKER_DESIGN.md for heuristic design and
+// threshold rationale.
 //
 // Token estimation: chars / 4. We never call a tokenizer — the embedding model
 // will count tokens for itself; this estimate is only used to pick window sizes.
-//
-// Both functions return the same Chunk shape; v1 leaves content_type /
-// section_heading undefined, and IndexingService falls back to 'prose' / NULL
-// when persisting them. Defaulting v1 chunks to 'prose' is intentional: it
-// means legacy rows in a partially-reindexed corpus aren't retroactively
-// demoted, only newly-emitted reference blocks under v2 are.
 
 export type ContentType = 'prose' | 'reference' | 'mixed';
 
@@ -35,6 +20,12 @@ export interface Chunk {
   tokenCount: number;
   content_type?: ContentType;
   section_heading?: string;
+  /**
+   * Comma-joined gated-content tags: any subset of `ng_plus`, `secret`,
+   * `missable`. Used by RetrievalService to soft-penalize gated chunks when
+   * the question carries no scenario hint.
+   */
+  scenario?: string;
 }
 
 export interface ChunkOpts {
@@ -43,7 +34,6 @@ export interface ChunkOpts {
 }
 
 const CHARS_PER_TOKEN = 4;
-const ASCII_ART_THRESHOLD = 0.8;
 
 interface Segment {
   text: string;
@@ -55,21 +45,22 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
 
-function isMostlyAsciiArt(text: string): boolean {
-  const len = text.length;
-  if (len === 0) return true;
-  let alnum = 0;
-  for (let i = 0; i < len; i++) {
-    const c = text.charCodeAt(i);
-    if (
-      (c >= 48 && c <= 57) ||  // 0-9
-      (c >= 65 && c <= 90) ||  // A-Z
-      (c >= 97 && c <= 122)    // a-z
-    ) {
-      alnum++;
-    }
-  }
-  return (len - alnum) / len > ASCII_ART_THRESHOLD;
+// Detect gated-content scenarios in a chunk's text + heading. Returns a
+// comma-joined tag list (deterministic order) or undefined when nothing
+// matches. Same patterns as the scenario backfill in migration v6, kept in sync.
+//
+// Soft heuristic: false positives are tolerable because the retrieval
+// penalty is soft (0.7×) and only kicks in on plain questions.
+const NG_PLUS_RE = /\bnew game\s*\+|\bNG\+|\bsecond playthrough\b/i;
+const SECRET_RE = /\beaster egg\b|\bsecret (?:boss|ending|level|character)\b|\bhidden (?:boss|level)\b/i;
+const MISSABLE_RE = /\bmissable\b|\bpoint of no return\b/i;
+export function detectScenario(content: string, sectionHeading?: string): string | undefined {
+  const haystack = `${sectionHeading ?? ''}\n${content}`;
+  const tags: string[] = [];
+  if (NG_PLUS_RE.test(haystack)) tags.push('ng_plus');
+  if (SECRET_RE.test(haystack)) tags.push('secret');
+  if (MISSABLE_RE.test(haystack)) tags.push('missable');
+  return tags.length > 0 ? tags.join(',') : undefined;
 }
 
 function splitParagraphs(content: string): Segment[] {
@@ -144,88 +135,6 @@ function splitSentences(seg: Segment, windowChars: number): Segment[] {
   flush();
   return out;
 }
-
-export function chunkGuide(content: string, opts: ChunkOpts): Chunk[] {
-  if (!content || content.trim().length === 0) return [];
-
-  const windowChars = Math.max(1, opts.chunkSizeTokens) * CHARS_PER_TOKEN;
-  const overlapChars = Math.max(0, opts.chunkOverlapTokens) * CHARS_PER_TOKEN;
-
-  // Filter ASCII-art paragraphs *before* packing. If we waited until after, an
-  // art block packed with adjacent prose would slip through (the merged
-  // alnum-density would be acceptable) and the chunk would carry the art.
-  const paragraphs = splitParagraphs(content).filter(p => !isMostlyAsciiArt(p.text));
-
-  // Pack paragraphs greedily, sentence-splitting any that exceed the window.
-  const packed: Segment[] = [];
-  let buf = '';
-  let bufStart = -1;
-  let bufEnd = -1;
-  const flush = () => {
-    if (buf.length > 0 && bufStart >= 0) {
-      packed.push({ text: buf, start: bufStart, end: bufEnd });
-    }
-    buf = '';
-    bufStart = -1;
-    bufEnd = -1;
-  };
-
-  for (const para of paragraphs) {
-    if (para.text.length > windowChars) {
-      // Oversize paragraph — split into sentences first
-      flush();
-      const sentenceChunks = splitSentences(para, windowChars);
-      for (const sc of sentenceChunks) {
-        packed.push(sc);
-      }
-      continue;
-    }
-    // +2 for the \n\n we'd join paragraphs with (estimate)
-    const joinerLen = buf.length === 0 ? 0 : 2;
-    if (buf.length + joinerLen + para.text.length > windowChars) {
-      flush();
-    }
-    if (buf.length === 0) {
-      bufStart = para.start;
-      buf = para.text;
-      bufEnd = para.end;
-    } else {
-      buf += '\n\n' + para.text;
-      bufEnd = para.end;
-    }
-  }
-  flush();
-
-  // Apply overlap and emit, skipping ASCII art.
-  const chunks: Chunk[] = [];
-  let prevTail = '';
-  for (const seg of packed) {
-    if (isMostlyAsciiArt(seg.text)) continue;
-
-    let combined = seg.text;
-    if (overlapChars > 0 && prevTail.length > 0) {
-      combined = prevTail + '\n\n' + seg.text;
-    }
-
-    chunks.push({
-      index: chunks.length,
-      content: combined,
-      charStart: seg.start,
-      charEnd: seg.end,
-      tokenCount: estimateTokens(combined),
-    });
-
-    prevTail = overlapChars > 0
-      ? seg.text.slice(Math.max(0, seg.text.length - overlapChars))
-      : '';
-  }
-
-  return chunks;
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// chunkGuideV2 — type-aware chunker (see CHUNKER_DESIGN.md)
-// ──────────────────────────────────────────────────────────────────────────
 
 type LineTag = 'blank' | 'divider' | 'kv' | 'toc' | 'versionlog' | 'name' | 'prose';
 type ParaType = 'prose' | 'reference' | 'mixed' | 'header' | 'drop';
@@ -456,6 +365,7 @@ function packTypeAwareChunks(
       tokenCount: estimateTokens(combined),
       content_type: ct,
       section_heading: heading,
+      scenario: detectScenario(combined, heading),
     });
     lastEmittedType = ct;
     lastEmittedTail = overlapChars > 0
@@ -539,7 +449,7 @@ function packTypeAwareChunks(
   return out;
 }
 
-export function chunkGuideV2(content: string, opts: ChunkOpts): Chunk[] {
+export function chunkGuide(content: string, opts: ChunkOpts): Chunk[] {
   if (!content || content.trim().length === 0) return [];
 
   const windowChars = Math.max(1, opts.chunkSizeTokens) * CHARS_PER_TOKEN;
@@ -551,7 +461,7 @@ export function chunkGuideV2(content: string, opts: ChunkOpts): Chunk[] {
 }
 
 // Internal exports for unit tests. Not part of the public API; the indexer
-// only calls chunkGuide / chunkGuideV2.
+// only calls chunkGuide.
 export const __testing = {
   classifyLine,
   classifyParagraph,

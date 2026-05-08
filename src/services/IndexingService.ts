@@ -10,8 +10,7 @@ import { config } from '../config';
 import DefaultDatabase from '../database/database';
 import type { IDatabase } from '../interfaces/IDatabase';
 import type { Guide } from '../types';
-import { AnnIndex } from './AnnIndex';
-import { chunkGuide, chunkGuideV2, type Chunk } from './Chunker';
+import { chunkGuide, type Chunk } from './Chunker';
 import { EmbeddingService } from './EmbeddingService';
 
 export interface IndexProgress {
@@ -147,9 +146,9 @@ export class IndexingService {
           id, guide_id, chunk_index, content,
           gamefaqs_id, franchise, language, guide_author, guide_type, review_status,
           char_start, char_end, token_count, created_at,
-          content_type, section_heading
+          content_type, section_heading, scenario
         )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     const deleteChunksStmt = this.db.getDb().prepare('DELETE FROM chunks WHERE guide_id = ?');
     const updateIndexedAtStmt = this.db.getDb().prepare('UPDATE guides SET indexed_at = ? WHERE id = ?');
@@ -181,15 +180,6 @@ export class IndexingService {
       gamePrefix: string;
     };
 
-    // Chunker dispatch is per-process: read once at loop start so a config
-    // change requires a restart, not a re-read on each guide. Both functions
-    // share the same Chunk shape; v1 leaves content_type undefined and we
-    // default to 'prose' at insert.
-    const chunker = config.chunkerVersion === 'v2' ? chunkGuideV2 : chunkGuide;
-    if (config.chunkerVersion === 'v2') {
-      console.log('[Indexing] using chunker v2 (type-aware)');
-    }
-
     // Loaded once at start; per-guide game lookup uses this prepared statement.
     const selectGameStmt = this.db.getDb().prepare(
       'SELECT title, platform FROM games WHERE id = ?'
@@ -219,7 +209,7 @@ export class IndexingService {
       );
       if (!guide) return null;
       lastLoadedId = guide.id;
-      const chunks = chunker(guide.content, {
+      const chunks = chunkGuide(guide.content, {
         chunkSizeTokens: config.chunkSizeTokens,
         chunkOverlapTokens: config.chunkOverlapTokens,
       });
@@ -301,7 +291,7 @@ export class IndexingService {
             chunkId, guide.id, c.index, indexedContent,
             chunkMeta.gamefaqsId, chunkMeta.franchise, chunkMeta.language, chunkMeta.guideAuthor, chunkMeta.guideType, chunkMeta.reviewStatus,
             c.charStart, c.charEnd, c.tokenCount, now,
-            c.content_type ?? 'prose', c.section_heading ?? null
+            c.content_type ?? 'prose', c.section_heading ?? null, c.scenario ?? null
           );
           insertedRowids.push(Number(r.lastInsertRowid));
         }

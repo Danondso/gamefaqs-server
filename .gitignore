@@ -42,4 +42,9 @@ Thumbs.db
 
 # Bench Q&A dump files (written by rag-bench-dump.mjs and rag-accuracy.test.ts)
 /bench-qa.txt
+/bench-qa.*.txt
 /tests/benchmarks/bench-qa.txt
+
+# Per-fix benchmark dumps from local iteration loops
+/benchmark-fix-*.txt
+/rag-bench-last-run.log

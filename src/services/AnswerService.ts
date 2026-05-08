@@ -135,9 +135,20 @@ export class AnswerService {
       }
     }
 
+    // Resolve a display title to enrich refusal messages when extraction
+    // identified the game. Pulled from extraction.gameId (when confident) or
+    // the caller-supplied filter so a downstream "I have guides for X but…"
+    // message has something concrete to say.
+    const resolvedGameId = extraction.status === 'confident'
+      ? extraction.gameId
+      : (filters.gameId ?? undefined);
+    const refusalCtx = resolvedGameId
+      ? { gameTitle: this.lookupGameTitles([resolvedGameId])[0]?.title }
+      : {};
+
     if (citations.length === 0) {
       return {
-        answer: this.refusals.build('retrieval_thin', question),
+        answer: this.refusals.build('retrieval_thin', question, refusalCtx),
         no_answer: true,
         citations: [],
         extraction,
@@ -153,7 +164,7 @@ export class AnswerService {
     const synthStart = performance.now();
     const { answer, no_answer } = await this.synthesis.synthesize(question, citations);
     const synthMs = performance.now() - synthStart;
-    const finalAnswer = no_answer ? this.refusals.build('synthesis_cant_ground', question) : answer;
+    const finalAnswer = no_answer ? this.refusals.build('synthesis_cant_ground', question, refusalCtx) : answer;
 
     return {
       answer: finalAnswer,

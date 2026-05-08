@@ -168,9 +168,14 @@ describe('SynthesisService.synthesize — grounded answers', () => {
   });
 
   it('preserves multi-citation references like [1,2]', async () => {
+    // Use shared distinctive tokens (Equip, sword) in both chunk contents so
+    // the post-synth citation verifier accepts both [1] and [2] as supporting.
     stubFetch('Equip the sword first [1,2], then fight the boss.');
     const svc = makeSvc();
-    const result = await svc.synthesize('q', makeCitations(['A', 'B']));
+    const cits = makeCitations(['A', 'B']);
+    cits[0].content = 'Equip the sword from your inventory before approaching the boss room.';
+    cits[1].content = 'The starter sword is the most reliable weapon to equip early on.';
+    const result = await svc.synthesize('q', cits);
     expect(result.no_answer).toBe(false);
     expect(result.answer).toContain('[1,2]');
   });

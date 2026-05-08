@@ -212,10 +212,21 @@ interface ChunkRow {
   chunk_index: number;
   content: string;
   gamefaqs_id: string | null;
+  scenario: string | null;
   guide_title: string;
   guide_game_id: string | null;
   guide_metadata: string | null;
 }
+
+// Scenario-cue regex over the question text. When ANY cue matches we skip the
+// soft penalty: the user is asking about gated content (NG+ / secret / etc).
+//
+// `before` is whitelisted only against gating nouns — `before disc 2`,
+// `before the boss fight`, `before the point of no return`. A bare
+// `before \w+` would fire on benign sequencing language ("get X before Y")
+// and disable the penalty across most questions.
+const SCENARIO_CUE_RE = /\b(?:secret|hidden|easter\s*egg|missable|ng\+|new\s*game\s*\+|second\s+playthrough|early|before\s+(?:disc|act|chapter|phase|the\s+(?:fight|battle|boss|point\s+of\s+no\s+return|cutoff))|point\s+of\s+no\s+return)\b/i;
+const SCENARIO_PENALTY = 0.7;
 
 export class RetrievalService {
   private readonly db: IDatabase;
@@ -579,18 +590,26 @@ export class RetrievalService {
     filteredTitle.forEach(h => {
       scores.set(h.chunk_id, (scores.get(h.chunk_id) ?? 0) + 1 / (this.rrfK + (h.rank + 1)));
     });
+    // Over-fetch by 2x when the scenario penalty might re-rank gated chunks
+    // out of the top window — otherwise we'd never see the chunks we're trying
+    // to PROMOTE. When there's a scenario cue in the question, no penalty
+    // applies and we don't need the over-fetch.
+    const hasScenarioCue = SCENARIO_CUE_RE.test(question);
+    const fetchK = hasScenarioCue ? topK : topK * 2;
+
     const ranked = Array.from(scores.entries())
       .sort((a, b) => b[1] - a[1])
-      .slice(0, topK);
+      .slice(0, fetchK);
 
     if (ranked.length === 0) {
       return { citations: [], embedMs, retrieveMs: now() - tRetrieveStart };
     }
 
-    // Single hydration query.
+    // Single hydration query — pulls scenario alongside guide metadata so the
+    // soft penalty can run without a second round-trip.
     const placeholders = ranked.map(() => '?').join(',');
     const rows = this.db.query<ChunkRow>(
-      `SELECT c.id, c.guide_id, c.chunk_index, c.content, c.gamefaqs_id,
+      `SELECT c.id, c.guide_id, c.chunk_index, c.content, c.gamefaqs_id, c.scenario,
               g.title AS guide_title, g.game_id AS guide_game_id, g.metadata AS guide_metadata
        FROM chunks c
        JOIN guides g ON g.id = c.guide_id
@@ -599,8 +618,24 @@ export class RetrievalService {
     );
     const byId = new Map(rows.map(r => [r.id, r]));
 
+    // Apply the scenario soft penalty when the question has no scenario cue:
+    // gated chunks (NG+/secret/missable) get their fusion score multiplied by
+    // 0.7, then we re-sort and take topK. This is a soft rerank — the chunks
+    // still surface if nothing better outranks them, but plain "How do I beat
+    // X" no longer has gated content drowning the canonical answer.
+    let adjusted: Array<[string, number]> = ranked;
+    if (!hasScenarioCue) {
+      adjusted = ranked.map(([chunkId, score]) => {
+        const row = byId.get(chunkId);
+        const penalize = !!(row && row.scenario);
+        return [chunkId, penalize ? score * SCENARIO_PENALTY : score];
+      });
+      adjusted.sort((a, b) => b[1] - a[1]);
+    }
+    const final = adjusted.slice(0, topK);
+
     const citations: Citation[] = [];
-    for (const [chunkId, score] of ranked) {
+    for (const [chunkId, score] of final) {
       const row = byId.get(chunkId);
       if (!row) continue;
       citations.push({
@@ -1004,10 +1039,6 @@ export class RetrievalService {
     return { ids: [], phraseTokens: [], confidence: 'none' };
   }
 
-  private queryGamesFtsPhrase(phraseTokens: string[]): string[] {
-    return this.queryGamesFtsPhraseWithTitles(phraseTokens).map(r => r.game_id);
-  }
-
   private queryGamesFtsPhraseWithTitles(phraseTokens: string[]): { game_id: string; title: string }[] {
     // FTS5 phrase syntax: "word1 word2 word3" matches contiguous tokens.
     // Quote individual tokens to neutralize accidental keyword shape, then
@@ -1048,18 +1079,6 @@ export class RetrievalService {
       // games_fts may not exist (pre-v5 DB) — silently fall back to no match.
       return [];
     }
-  }
-
-  private expandGameMatchToChunks(gameIds: string[]): string[] {
-    if (gameIds.length === 0) return [];
-    const placeholders = gameIds.map(() => '?').join(',');
-    const rows = this.db.query<{ id: string }>(
-      `SELECT c.id FROM chunks c
-       JOIN guides g ON g.id = c.guide_id
-       WHERE g.game_id IN (${placeholders})`,
-      gameIds
-    );
-    return rows.map(r => r.id);
   }
 
   // Each TitleHit carries a guide-level rank; we emit one entry per chunk in

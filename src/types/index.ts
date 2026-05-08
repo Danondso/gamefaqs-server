@@ -46,21 +46,6 @@ export interface Note {
   updated_at: number;
 }
 
-export interface Achievement {
-  id: string;
-  ra_achievement_id: string;
-  game_id: string;
-  title: string;
-  description: string;
-  points?: number | null;
-  badge_url?: string | null;
-  is_pinned: boolean;
-  is_unlocked: boolean;
-  unlock_time?: number | null;
-  created_at: number;
-  updated_at: number;
-}
-
 // Metadata types
 export interface GuideMetadata {
   platform?: string;

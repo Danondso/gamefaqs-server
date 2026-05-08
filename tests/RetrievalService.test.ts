@@ -4,6 +4,7 @@ import type { IDatabase } from '../src/interfaces/IDatabase';
 import {
   RetrievalService,
   sanitizeFtsQuery,
+  abbreviationVariants,
   extractGameMatchTokens,
   numeralAliasVariants,
   type FtsHit,
@@ -184,14 +185,17 @@ describe('RetrievalService', () => {
       rrfK: 60,
     });
 
-    const citations = await svc.retrieve("what's the best class in diablo", {}, 5);
+    await svc.retrieve("what's the best class in diablo", {}, 5);
+    // Contract: the rare-token filter on the *title query*. "best" and
+    // "class" exceed the document-frequency threshold; "diablo" stays.
+    // After fix-6 title-FTS only contributes to chunks that ALSO have
+    // vec/FTS evidence, so chunk surface from a title-only mock is no
+    // longer the design — the query observation is what proves the
+    // rare-token filter ran.
     expect(observedTitleQuery).not.toBeNull();
     expect(observedTitleQuery!.toLowerCase()).toContain('diablo');
     expect(observedTitleQuery!.toLowerCase()).not.toContain('best');
     expect(observedTitleQuery!.toLowerCase()).not.toContain('class');
-    // Only Diablo chunks should surface (vec/FTS returned nothing).
-    const ids = new Set(citations.map(c => c.chunk_id));
-    expect(ids).toEqual(new Set(['cd-1', 'cd-2']));
   });
 
   it('boosts chunks of title-matched guides via the title source', async () => {
@@ -585,5 +589,46 @@ describe('numeralAliasVariants', () => {
     expect(variants).toContainEqual(['ff', '10', '2']);
     expect(variants).toContainEqual(['ff', 'x', 'ii']);
     expect(variants).toContainEqual(['ff', '10', 'ii']);
+  });
+});
+
+describe('abbreviationVariants', () => {
+  it('returns the original alone when no abbreviations present', () => {
+    expect(abbreviationVariants(['solid', 'snake']))
+      .toEqual([['solid', 'snake']]);
+  });
+
+  it('expands a phrase-final abbreviation', () => {
+    // "san andreas gta" — gta sits at the end of the phrase, so adjacency
+    // boundary fires regardless of numerals.
+    const variants = abbreviationVariants(['san', 'andreas', 'gta']);
+    expect(variants).toContainEqual(['san', 'andreas', 'gta']);
+    expect(variants).toContainEqual(['san', 'andreas', 'grand', 'theft', 'auto']);
+  });
+
+  it('expands a phrase-initial abbreviation', () => {
+    const variants = abbreviationVariants(['gta', 'san', 'andreas']);
+    expect(variants).toContainEqual(['gta', 'san', 'andreas']);
+    expect(variants).toContainEqual(['grand', 'theft', 'auto', 'san', 'andreas']);
+  });
+
+  it('expands abbreviations adjacent to a numeral', () => {
+    // "mgs 2" — mgs is adjacent to numeric token 2.
+    const variants = abbreviationVariants(['mgs', '2']);
+    expect(variants).toContainEqual(['mgs', '2']);
+    expect(variants).toContainEqual(['metal', 'gear', 'solid', '2']);
+  });
+
+  it('does NOT expand a mid-phrase abbreviation with no numeral neighbour', () => {
+    // The classic "Re: that question" trap — `re` mid-phrase, no boundary,
+    // no numeral neighbour, must NOT expand.
+    const variants = abbreviationVariants(['that', 're', 'question']);
+    expect(variants).toEqual([['that', 're', 'question']]);
+  });
+
+  it('caps the powerset at 4 variants when 2+ abbreviations match', () => {
+    // Two abbreviations both at boundaries: produces full 2x2 = 4 variants.
+    const variants = abbreviationVariants(['gta', 'is', 'mgs']);
+    expect(variants.length).toBe(4);
   });
 });

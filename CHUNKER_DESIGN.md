@@ -1,9 +1,11 @@
-# Chunker rework: design
+# Chunker design
 
-**Phase 2 of the chunker rework.** Builds on the patterns inventoried in
-`CHUNKER_INVESTIGATION.md`. Target: each emitted chunk holds a single
-content type, carries a `content_type` tag, and respects natural section
-boundaries in the source.
+The type-aware chunker classifies every line and paragraph, then packs
+chunks so each one holds a single content type, carries a `content_type`
+tag, and respects natural section boundaries in the source. This is the
+load-bearing design doc; `CHUNKER_INVESTIGATION.md` (archival) inventories
+the failure modes of the previous greedy paragraph-packing implementation
+that motivated this design.
 
 ## 0. Output contract
 
@@ -363,25 +365,14 @@ confidently handle. Retrieval can leave them at neutral weight; this
 prevents over-aggressive demotion of borderline content (e.g., a guide
 section that genuinely interleaves narrative + 1–2 KV lookup lines).
 
-## 7. Defaults, knobs, and reversibility
+## 7. Knobs
 
-Add an environment variable to gate the new chunker:
-
-```
-CHUNKER_VERSION=v2   # default v1 (legacy) until validation passes
-```
-
-The indexer reads this and dispatches to `chunkGuideV1` or `chunkGuideV2`.
-Phase 4's small-corpus eyeball runs with `CHUNKER_VERSION=v2`. Phase 5's
-full re-index flips the default once the bench shows improvement. If the
-bench regresses, flipping back to v1 + revert migration v11 restores the
-prior state. Schema-side, `content_type` defaulting to `'prose'` means
-queries that filter by content_type will see legacy chunks as prose
-(neutral baseline) until they're re-indexed.
-
-The new chunker is implemented as a sibling function, NOT a refactor of
-`chunkGuide()`. The legacy function stays. This keeps the diff legible and
-the rollback trivial.
+The classifier's hot paths (`classifyLine`, `classifyParagraph`) are pure
+functions with no I/O — adjusting any of the thresholds in §8 is a
+unit-test change plus a re-index. Schema-side, `chunks.content_type`
+defaults to `'prose'`, so any chunks already on disk from before this
+chunker existed read as prose at neutral weight rather than being
+retroactively demoted.
 
 ## 8. Proposed thresholds (initial values, calibrated against samples)
 
@@ -402,10 +393,9 @@ the rollback trivial.
 | Header line max chars | 60 | Banner labels short by convention | yes |
 | Prose ratio | 0.5 | Conservative — pushes ambiguous to `mixed` | yes |
 
-These values are not sacred. The classifier's hot paths (`classifyParagraph`,
-`classifyLine`) are pure functions with no I/O — adjusting a threshold is
-a unit-test change and a re-index. Phase 5's bench tells us if any
-threshold mis-fires on real data.
+These values are not sacred. Adjusting any of them is a unit-test change
+plus a re-index; the bench in `tests/benchmarks/rag-accuracy.test.ts` is
+the load-bearing signal for whether a threshold change helps or hurts.
 
 ## 9. What this design does NOT do
 
@@ -421,58 +411,15 @@ threshold mis-fires on real data.
 - Does NOT touch the existing oversize-paragraph fallback (sentence-split).
   That path inherits the parent paragraph's content_type.
 
-## 10. Implementation outline (for Phase 3)
+## 10. Settled design choices
 
-Files touched:
-
-- `src/services/Chunker.ts` — new `chunkGuideV2()` alongside `chunkGuide()`.
-  Helpers: `classifyLine`, `classifyParagraph`, `unframe`, `isBordered`,
-  `packTypeAwareChunks`. ~250–400 LOC.
-- `src/services/IndexingService.ts` — read `CHUNKER_VERSION`, dispatch.
-  Also pass through `content_type` and `section_heading` to insert. ~10 LOC.
-- `src/database/migrations.ts` — add `migration_v11`. Adds two columns.
-  `content_type` defaulted to `'prose'`. ~25 LOC.
-- `src/database/schema.ts` — bump `SCHEMA_VERSION` to 11. Update the
-  `chunks` CREATE TABLE for fresh DBs. ~5 LOC.
-- `tests/Chunker.test.ts` — new unit tests against fixtures pulled from
-  the bench-qa samples (one per content type). ~150 LOC.
-
-Total estimated: ~450–600 LOC + tests + migration.
-
-## 11. Risks and how Phase 5 catches them
-
-- **Risk: classifier is over-eager and mis-tags A2 prose as reference.**
-  Mitigated by frame-strip + KV terminator gate + sample validation in §4.
-  Phase 5: Q1 Sephiroth bench would regress (the strategy chunk would be
-  tagged as `reference`); we'd see it immediately.
-- **Risk: classifier mis-tags Q&A or labeled prose.** Mitigated by the
-  KV value-length / no-terminator gate. Phase 5: Q22 W-Item dupe regression.
-- **Risk: chunk count balloons** (more chunks per guide → bigger index,
-  more embedding cost). Phase 4 measures total chunks before vs after on
-  a 100-guide subset. Acceptable budget: +30%. If +>50%, raise the
-  type-shift flush threshold (allow same-type merge across small mixed
-  blocks).
-- **Risk: header attachment is wrong** (header attaches to the wrong
-  next-block when blanks separate them). Mitigated by attaching to the
-  *immediate* next block; if a divider intervenes, the header survives
-  as `pendingHeading` until consumed.
-- **Risk: re-index is slow** (~3.7M chunks in current corpus). Embedding
-  is the cost driver, not chunking. Phase 5 budgets time explicitly; user
-  said reindex must be reversible (deletion of `${dbPath}.ann` plus the
-  v11 down-migration restores prior state).
-
-## 12. Open questions before Phase 3
-
-- Should `section_heading` be persisted, or kept ephemeral (computed on
-  read)? **Proposal: persist.** Computing on read means re-deriving from
-  paragraph offsets every retrieval, which is more expensive than 1 column.
-- Should `mixed` be retired in favor of `reference`/`prose` always-decide?
-  **Proposal: keep `mixed` for now.** It's a 3-class decision; pushing
-  borderline cases into a fence-sit class is safer than 50/50 misclassifying
-  them.
-- Should the type-shift flush also fire on `mixed`-to-`prose` and
-  `mixed`-to-`reference` transitions? **Proposal: no.** `mixed` is a sink;
-  forcing flushes around it just makes more tiny chunks. The "shift only
-  matters for prose↔reference" rule keeps the heuristic mild.
-
-These are calls I'm taking unless you flag a concern.
+- **`section_heading` is persisted.** Computing on read would mean
+  re-deriving from paragraph offsets every retrieval, which is more
+  expensive than a single column.
+- **`mixed` is kept as a third class.** Pushing borderline cases into a
+  fence-sit class is safer than 50/50 misclassifying them as prose or
+  reference.
+- **Type-shift flush fires only on `prose ↔ reference` transitions, not on
+  any `mixed` transition.** `mixed` is a sink; flushing around it would
+  just produce more tiny chunks. Keeping the rule narrow keeps the
+  heuristic mild.
